@@ -441,35 +441,75 @@ async def handle_message(event):
 # ============================================================================
 
 async def cmd_status(event):
-    """Affiche le statut complet du bot."""
+    """Affiche le statut complet avec les compteurs de tous les costumes."""
     if event.is_group or event.is_channel: 
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Réservé admin")
         return
 
-    msg = f"""📊 **STATUT DU BOT**
+    msg = f"""📈 **COUNTERS DE MANQUES DES CYCLES**
 
 🎮 Dernier jeu: #{current_game_number}
-📋 Prédictions actives: {len(pending_predictions)}
+📋 File d'attente: {len(prediction_queue)} prédiction(s)
 🔄 Rattrapages en cours: {len(rattrapage_tracking)}
 
-**🔮 PRÉDICTIONS:**
 """
 
-    for num, pred in sorted(pending_predictions.items()):
-        ratt = f" (R{pred['rattrapage']})" if pred.get('rattrapage', 0) > 0 else ""
-        msg += f"• #{num}{ratt}: {pred['suit']} - {pred['status']}\n"
+    # Afficher les compteurs pour chaque couleur
+    for suit in ALL_SUITS:
+        if suit in cycle_trackers:
+            tracker = cycle_trackers[suit]
+            current = tracker.get_current_target()
+
+            # Barre de progression
+            filled = "█" * tracker.miss_counter
+            empty = "░" * (CONSECUTIVE_FAILURES_NEEDED - tracker.miss_counter)
+            progress_bar = f"[{filled}{empty}]"
+
+            msg += f"""📊 {tracker.get_display_name()}
+   ├─ 🎯 Numéro du cycle analysé: #{current if current else 'Aucun'}
+   ├─ 📉 Compteur de manques: {tracker.miss_counter}/{CONSECUTIVE_FAILURES_NEEDED} {progress_bar}
+   ├─ 🔄 Tour: {tracker.current_tour}/{CONSECUTIVE_FAILURES_NEEDED}
+"""
+
+            if tracker.pending_prediction:
+                msg += f"   └─ 🔮 PRÉDICTION: Jouer #{tracker.pending_prediction}\n\n"
+            elif tracker.miss_counter == 1:
+                next_check = tracker.get_next_target()
+                msg += f"   └─ ⏳ Prochaine vérif: #{next_check if next_check else 'N/A'}\n\n"
+            else:
+                msg += f"   └─ ✅ En attente\n\n"
+
+    # Afficher les prédictions actives
+    if pending_predictions:
+        msg += "**🔮 PRÉDICTIONS ACTIVES:**\n"
+        for num, pred in sorted(pending_predictions.items()):
+            ratt = f" (R{pred['rattrapage']})" if pred.get('rattrapage', 0) > 0 else ""
+            msg += f"• #{num}{ratt}: {pred['suit']} - {pred['status']}\n"
+    else:
+        msg += "**🔮 Aucune prédiction active**\n"
 
     await event.respond(msg)
 
 async def cmd_help(event):
-    """Affiche l'aide."""
+    """Affiche l'aide complète avec toutes les commandes."""
     if event.is_group or event.is_channel: 
         return
-    await event.respond("""📖 **BACCARAT AI - Aide**
 
-**Système de Rattrapages:**
+    help_text = """📖 **BACCARAT AI - AIDE COMPLÈTE**
+
+═══════════════════════════════════════
+🎮 **SYSTÈME DE PRÉDICTION**
+═══════════════════════════════════════
+
+**Cycles des couleurs:**
+• ♠️ Pique: tous les 5 jeux (1, 6, 11, 16...)
+• ❤️ Cœur: tous les 6 jeux (1, 7, 13, 19...)
+• ♦️ Carreau: tous les 6 jeux (1, 7, 13, 19...)
+• ♣️ Trèfle: tous les 7 jeux (1, 8, 15, 22...)
+
+**Système de rattrapages:**
 • ✅0️⃣ = Trouvé au numéro prédit
 • ✅1️⃣ = Trouvé au numéro+1 (rattrapage 1)
 • ✅2️⃣ = Trouvé au numéro+2 (rattrapage 2)
@@ -478,15 +518,273 @@ async def cmd_help(event):
 **Détection des messages:**
 Le bot vérifie uniquement les messages **finalisés** (sans ⏰)
 
-**Commandes:**
-/status - Voir les prédictions actives
-/help - Cette aide
-""")
+═══════════════════════════════════════
+🔧 **COMMANDES ADMIN**
+═══════════════════════════════════════
+
+**/status**
+Affiche les compteurs de manques, les prédictions actives et la file d'attente.
+
+**/set_tours [1-5]**
+Définit le nombre de manques avant prédiction.
+Ex: `/set_tours 2` (défaut), `/set_tours 3`
+
+**/channels**
+Affiche les canaux configurés et leur statut d'accessibilité.
+
+**/test**
+Envoie une prédiction test au canal pour vérifier l'envoi automatique.
+
+**/announce [message]**
+Envoie une annonce décorée au canal de prédiction.
+Ex: `/announce 🎉 Mise à jour ce soir!`
+
+**/help**
+Affiche cette aide.
+
+═══════════════════════════════════════
+👨‍💻 **DÉVELOPPEUR**
+═══════════════════════════════════════
+
+**Sossou Kouamé**
+📱 WhatsApp: +229 01 95 50 15 64 😂
+
+⏳BACCARAT AI 🤖⏳
+"""
+
+    await event.respond(help_text)
+    logger.info(f"Help affichée pour user {event.sender_id}")
+
+
+# ============================================================================
+# COMMANDES ADMIN COMPLÉMENTAIRES
+# ============================================================================
+
+async def cmd_set_tours(event):
+    """Définit le nombre de tours avant prédiction."""
+    if event.is_group or event.is_channel: 
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Réservé admin")
+        return
+
+    global CONSECUTIVE_FAILURES_NEEDED
+
+    try:
+        match = re.search(r'/set_tours\s+(\d+)', event.message.message)
+        if not match:
+            await event.respond("📖 Usage: `/set_tours [1-5]`\nEx: `/set_tours 2`")
+            return
+
+        new_value = int(match.group(1))
+        if new_value < 1 or new_value > 5:
+            await event.respond("❌ Entre 1 et 5 uniquement")
+            return
+
+        old_value = CONSECUTIVE_FAILURES_NEEDED
+        CONSECUTIVE_FAILURES_NEEDED = new_value
+
+        # Reset les compteurs
+        for tracker in cycle_trackers.values():
+            tracker.miss_counter = 0
+            tracker.current_tour = 1
+
+        await event.respond(f"✅ Changé: {old_value} → {new_value} tours\nLes compteurs ont été réinitialisés.")
+        logger.info(f"Admin {event.sender_id}: {old_value} → {new_value} tours")
+
+    except Exception as e:
+        await event.respond(f"❌ Erreur: {e}")
+
+async def cmd_channels(event):
+    """Affiche les canaux configurés."""
+    if event.is_group or event.is_channel: 
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Réservé admin")
+        return
+
+    source_status = "❌ Inaccessible"
+    prediction_status = "❌ Inaccessible"
+
+    try:
+        if SOURCE_CHANNEL_ID:
+            await client.get_entity(SOURCE_CHANNEL_ID)
+            source_status = "✅ Accessible"
+    except:
+        pass
+
+    try:
+        if PREDICTION_CHANNEL_ID:
+            await client.get_entity(PREDICTION_CHANNEL_ID)
+            prediction_status = "✅ Accessible"
+    except:
+        pass
+
+    msg = f"""📡 **CANAUX CONFIGURÉS**
+
+🔹 **Canal Source**
+   ├─ ID: `{SOURCE_CHANNEL_ID}`
+   └─ Statut: {source_status}
+
+🔹 **Canal Prédiction**
+   ├─ ID: `{PREDICTION_CHANNEL_ID}`
+   └─ Statut: {prediction_status}
+
+🔹 **Admin ID**: `{ADMIN_ID}`
+
+💡 Vérifiez que le bot est membre des canaux avec les bonnes permissions."""
+
+    await event.respond(msg)
+
+async def cmd_test(event):
+    """Teste l'envoi automatique au canal de prédiction."""
+    if event.is_group or event.is_channel: 
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Réservé admin")
+        return
+
+    await event.respond("🧪 **TEST EN COURS**...")
+
+    try:
+        if not PREDICTION_CHANNEL_ID:
+            await event.respond("❌ Canal non configuré")
+            return
+
+        try:
+            entity = await client.get_entity(PREDICTION_CHANNEL_ID)
+            canal_nom = getattr(entity, 'title', 'Sans titre')
+        except Exception as e:
+            await event.respond(f"❌ Accès canal impossible: {e}")
+            return
+
+        # Envoi test
+        test_msg = """⏳BACCARAT AI 🤖⏳ [TEST]
+
+PLAYER : 9999 ♠️ : TEST EN COURS...."""
+
+        sent = await client.send_message(PREDICTION_CHANNEL_ID, test_msg)
+
+        await asyncio.sleep(2)
+
+        result_msg = """⏳BACCARAT AI 🤖⏳ [TEST]
+
+PLAYER : 9999 ♠️ : ✅ TEST RÉUSSI"""
+
+        await client.edit_message(PREDICTION_CHANNEL_ID, sent.id, result_msg)
+        await asyncio.sleep(2)
+        await client.delete_messages(PREDICTION_CHANNEL_ID, [sent.id])
+
+        await event.respond(f"""✅ **TEST RÉUSSI!**
+
+📋 Résultats:
+   ├─ Canal: {canal_nom}
+   ├─ Envoi: ✅ OK
+   ├─ Modification: ✅ OK
+   └─ Suppression: ✅ OK
+
+🎯 L'envoi automatique fonctionne!""")
+
+    except Exception as e:
+        await event.respond(f"❌ Échec: {e}")
+        logger.error(f"Test échoué: {e}")
+
+async def cmd_announce(event):
+    """Envoie une annonce décorée au canal."""
+    if event.is_group or event.is_channel: 
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Réservé admin")
+        return
+
+    full_message = event.message.message
+
+    if full_message.strip() in ['/announce', '/annonce']:
+        await event.respond("""📢 **ENVOYER UNE ANNONCE**
+
+Usage: `/announce Votre message`
+
+Exemple:
+`/announce 🎉 Nouvelle mise à jour!`
+
+Le message sera décoré et signé automatiquement.""")
+        return
+
+    parts = full_message.split(' ', 1)
+    if len(parts) < 2:
+        await event.respond("❌ Fournissez un message. Ex: `/announce Bonjour!`")
+        return
+
+    user_text = parts[1].strip()
+
+    if len(user_text) > 500:
+        await event.respond("❌ Trop long (max 500 caractères)")
+        return
+
+    try:
+        now = datetime.now()
+        date_str = now.strftime("%d/%m/%Y")
+        time_str = now.strftime("%H:%M")
+
+        announce_msg = f"""╔══════════════════════════════════════╗
+║     📢 ANNONCE OFFICIELLE 📢          ║
+╠══════════════════════════════════════╣
+
+{user_text}
+
+╠══════════════════════════════════════╣
+║  📅 {date_str}  🕐 {time_str}
+╠══════════════════════════════════════╣
+║  👨‍💻 Développé par: **Sossou Kouamé**
+║  📱 WhatsApp: **+229 01 95 50 15 64** 😂
+╚══════════════════════════════════════╝
+
+⏳BACCARAT AI 🤖⏳"""
+
+        if not PREDICTION_CHANNEL_ID:
+            await event.respond("❌ Canal non configuré")
+            return
+
+        sent = await client.send_message(PREDICTION_CHANNEL_ID, announce_msg)
+
+        await event.respond(f"""✅ **ANNONCE ENVOYÉE!**
+
+📋 Détails:
+   ├─ Canal: {PREDICTION_CHANNEL_ID}
+   ├─ Message ID: {sent.id}
+   ├─ Longueur: {len(user_text)} caractères
+   └─ Signé: Sossou Kouamé 😂
+
+📤 Annonce publiée avec succès.""")
+
+    except Exception as e:
+        await event.respond(f"❌ Erreur: {e}")
+        logger.error(f"Announce échouée: {e}")
+
 
 def setup_handlers():
-    client.add_event_handler(cmd_status, events.NewMessage(pattern='/status'))
-    client.add_event_handler(cmd_help, events.NewMessage(pattern='/help'))
+    # Commandes simples (sans arguments)
+    client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
+    client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
+    client.add_event_handler(cmd_channels, events.NewMessage(pattern=r'^/channels$'))
+    client.add_event_handler(cmd_test, events.NewMessage(pattern=r'^/test$'))
+
+    # Commandes avec arguments - utiliser une fonction de filtre
+    client.add_event_handler(cmd_set_tours, events.NewMessage(func=is_set_tours_command))
+    client.add_event_handler(cmd_announce, events.NewMessage(func=is_announce_command))
+
+    # Messages entrants
     client.add_event_handler(handle_message, events.NewMessage())
+
+def is_set_tours_command(event):
+    """Vérifie si le message est la commande /set_tours."""
+    msg = event.message.message.strip()
+    return msg.startswith('/set_tours')
+
+def is_announce_command(event):
+    """Vérifie si le message est la commande /announce."""
+    msg = event.message.message.strip()
+    return msg.startswith('/announce')
 
 # ============================================================================
 # DÉMARRAGE
