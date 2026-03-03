@@ -14,7 +14,7 @@ def parse_channel_id(env_var: str, default: str) -> int:
 
 # Canaux Telegram
 SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
-PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1002543915361')
+PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003336559159')
 
 # Authentification
 ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
