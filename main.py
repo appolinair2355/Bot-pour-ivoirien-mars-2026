@@ -49,6 +49,11 @@ client = None
 suit_block_until: Dict[str, datetime] = {}
 waiting_finalization: Dict[int, dict] = {}
 
+# NOUVEAU : Historiques pour la commande /history
+finalized_messages_history: List[Dict] = []
+MAX_HISTORY_SIZE = 50
+prediction_history: List[Dict] = []
+
 # ============================================================================
 # CLASSES
 # ============================================================================
@@ -59,7 +64,7 @@ class SuitCycleTracker:
     suit: str
     cycle_numbers: List[int] = field(default_factory=list)
     current_tour: int = 1
-    miss_counter: int = 0
+    miss_counter: int = 0  # Nombre de tours complétés sans trouver la couleur
     pending_prediction: Optional[int] = None
     tour_checked_numbers: Set[int] = field(default_factory=set)
     verification_history: Dict[int, bool] = field(default_factory=dict)
@@ -93,19 +98,17 @@ class SuitCycleTracker:
             new_cycle = self.cycle_numbers[new_index]
             logger.info(f"🔄 {self.suit} avance: cycle #{old_cycle} → #{new_cycle} (jeu #{game_number})")
             
-            # Si on change de cycle, reset le tour en cours
+            # Si on change de cycle et qu'on n'est pas en plein suivi, reset
             if self.last_cycle_index >= 0 and new_index > self.last_cycle_index:
-                # On passe à un nouveau cycle, reset les compteurs
-                self.tour_checked_numbers.clear()
-                self.verification_history.clear()
-                # Ne pas reset miss_counter si on est en plein tour
-                if self.current_tour == 1:
-                    self.miss_counter = 0
+                # Seulement si on n'a pas de prédiction en attente et pas en cours d'analyse
+                if self.miss_counter == 0 and self.current_tour == 1:
+                    self.tour_checked_numbers.clear()
+                    self.verification_history.clear()
             
             self.last_cycle_index = new_index
     
     def get_current_cycle_target(self) -> Optional[int]:
-        """Retourne le numéro de cycle actuel."""
+        """Retourne le numéro de cycle actuel (base pour le tour en cours)."""
         if self.last_cycle_index >= 0 and self.last_cycle_index < len(self.cycle_numbers):
             return self.cycle_numbers[self.last_cycle_index]
         
@@ -117,16 +120,19 @@ class SuitCycleTracker:
         return self.cycle_numbers[-1] if self.cycle_numbers else None
     
     def get_numbers_to_check_this_tour(self) -> List[int]:
-        """Retourne les 3 numéros à vérifier pour le tour actuel."""
-        current_cycle = self.get_current_cycle_target()
-        if current_cycle is None:
-            return []
-        
+        """
+        Retourne les 3 numéros à vérifier pour le tour actuel.
+        Tour 1: cycle actuel, cycle+1, cycle+2
+        Tour 2: cycle suivant, cycle_suivant+1, cycle_suivant+2
+        """
         if self.current_tour == 1:
-            # Tour 1: cycle, cycle+1, cycle+2
+            # Tour 1: base sur le cycle actuel
+            current_cycle = self.get_current_cycle_target()
+            if current_cycle is None:
+                return []
             return [current_cycle, current_cycle + 1, current_cycle + 2]
         else:
-            # Tour 2: prochain cycle et les 2 suivants
+            # Tour 2: base sur le cycle suivant
             next_idx = self.last_cycle_index + 1
             if next_idx < len(self.cycle_numbers):
                 next_cycle = self.cycle_numbers[next_idx]
@@ -142,6 +148,7 @@ class SuitCycleTracker:
     def process_verification(self, game_number: int, suit_found: bool) -> Optional[int]:
         """
         Traite la vérification d'un numéro.
+        Retourne le numéro de prédiction si une prédiction doit être créée.
         """
         # Mettre à jour le cycle en fonction du jeu actuel
         self.update_to_current_game(game_number)
@@ -158,7 +165,7 @@ class SuitCycleTracker:
         self.verification_history[game_number] = suit_found
         
         if suit_found:
-            logger.info(f"✅ {self.suit} trouvé au jeu #{game_number} (Tour {self.current_tour})")
+            logger.info(f"✅ {self.suit} trouvé au jeu #{game_number} (Tour {self.current_tour}) - RESET")
             self.reset()
             return None
         
@@ -168,24 +175,34 @@ class SuitCycleTracker:
         
         # Tour terminé (3 numéros vérifiés)
         if tour_misses >= NUMBERS_PER_TOUR:
+            # Incrémenter le compteur de manques (tours complétés sans trouver)
             self.miss_counter += 1
             logger.info(f"📊 {self.suit} Tour {self.current_tour} terminé - Manques: {self.miss_counter}/{CONSECUTIVE_FAILURES_NEEDED}")
             
-            # Assez de manques pour prédire
+            # VÉRIFICATION: Assez de manques pour prédire ?
             if self.miss_counter >= CONSECUTIVE_FAILURES_NEEDED:
-                pred_idx = self.last_cycle_index + self.miss_counter + 1
+                # PRÉDICTION: jouer au cycle après le dernier vérifié
+                # Si Tour 1 échoué → prédire cycle+1 (prochain cycle)
+                # Si Tour 1+2 échoués → prédire cycle d'après le tour 2
+                pred_idx = self.last_cycle_index + self.miss_counter
                 if pred_idx < len(self.cycle_numbers):
                     pred_num = self.cycle_numbers[pred_idx]
                     self.pending_prediction = pred_num
-                    logger.info(f"🔮 {self.suit} PRÉDICTION pour #{pred_num}")
+                    logger.info(f"🔮 {self.suit} PRÉDICTION pour #{pred_num} (après {self.miss_counter} tour(s) échoué(s))")
                     self.reset_after_prediction()
                     return pred_num
             
-            # Passer au tour suivant
-            self.current_tour += 1
-            self.tour_checked_numbers.clear()
-            self.last_cycle_index += 1
-            logger.info(f"🔄 {self.suit} passe au Tour {self.current_tour}")
+            # Passer au tour suivant (s'il reste des tours à faire)
+            if self.current_tour < CONSECUTIVE_FAILURES_NEEDED:
+                self.current_tour += 1
+                self.tour_checked_numbers.clear()
+                # Avancer l'index pour le prochain tour (Tour 2 utilise le cycle suivant)
+                self.last_cycle_index += 1
+                logger.info(f"🔄 {self.suit} passe au Tour {self.current_tour} (cycle suivant)")
+            else:
+                # On a fait tous les tours nécessaires mais pas de prédition ?
+                logger.warning(f"⚠️ {self.suit} tous tours terminés mais pas de prédiction")
+                self.reset()
         
         return None
     
@@ -203,6 +220,75 @@ class SuitCycleTracker:
         self.miss_counter = 0
         self.tour_checked_numbers.clear()
         self.verification_history.clear()
+
+# ============================================================================
+# FONCTIONS D'HISTORIQUE
+# ============================================================================
+
+def add_to_history(game_number: int, message_text: str, first_group: str, suits_found: List[str]):
+    """Ajoute un message finalisé à l'historique."""
+    global finalized_messages_history
+    
+    entry = {
+        'timestamp': datetime.now(),
+        'game_number': game_number,
+        'message_text': message_text[:200],
+        'first_group': first_group,
+        'suits_found': suits_found,
+        'predictions_verified': []
+    }
+    
+    finalized_messages_history.insert(0, entry)
+    
+    if len(finalized_messages_history) > MAX_HISTORY_SIZE:
+        finalized_messages_history = finalized_messages_history[:MAX_HISTORY_SIZE]
+
+def add_prediction_to_history(game_number: int, suit: str, verification_games: List[int]):
+    """Ajoute une prédiction à l'historique."""
+    global prediction_history
+    
+    prediction_history.insert(0, {
+        'predicted_game': game_number,
+        'suit': suit,
+        'predicted_at': datetime.now(),
+        'verification_games': verification_games,
+        'status': 'en_cours',
+        'verified_by': []
+    })
+    
+    if len(prediction_history) > MAX_HISTORY_SIZE:
+        prediction_history = prediction_history[:MAX_HISTORY_SIZE]
+
+def update_prediction_in_history(game_number: int, suit: str, verified_by_game: int, 
+                                verified_by_group: str, rattrapage_level: int, final_status: Optional[str] = None):
+    """Met à jour l'historique quand une prédiction est vérifiée."""
+    global finalized_messages_history, prediction_history
+    
+    # Mettre à jour la prédiction
+    for pred in prediction_history:
+        if pred['predicted_game'] == game_number and pred['suit'] == suit:
+            pred['verified_by'].append({
+                'game_number': verified_by_game,
+                'first_group': verified_by_group,
+                'rattrapage_level': rattrapage_level
+            })
+            if final_status:
+                pred['status'] = final_status
+            break
+    
+    # Mettre à jour le message finalisé pour indiquer qu'il a servi à une vérif
+    for msg in finalized_messages_history:
+        if msg['game_number'] == verified_by_game:
+            msg['predictions_verified'].append({
+                'predicted_game': game_number,
+                'suit': suit,
+                'rattrapage_level': rattrapage_level
+            })
+            break
+
+# ============================================================================
+# INITIALISATION
+# ============================================================================
 
 def initialize_trackers(max_game: int = 3000):
     """Initialise les trackers pour chaque couleur."""
@@ -285,6 +371,11 @@ PLAYER : {game_number} {SUIT_DISPLAY.get(suit, suit)} : en cours...."""
             'sent_time': datetime.now()
         }
         
+        # AJOUTER À L'HISTORIQUE
+        if is_rattrapage == 0:
+            verification_games = [game_number, game_number + 1, game_number + 2]
+            add_prediction_to_history(game_number, suit, verification_games)
+        
         logger.info(f"✅ Prédiction envoyée: #{game_number} {suit}")
         return sent.id
         
@@ -305,6 +396,8 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
             
             if target_suit in suits_in_result:
                 await update_prediction_message(game_number, '✅0️⃣', True)
+                # METTRE À JOUR L'HISTORIQUE
+                update_prediction_in_history(game_number, target_suit, game_number, first_group, 0, 'gagne_r0')
                 return True
             else:
                 pred['awaiting_rattrapage'] = 1
@@ -321,6 +414,9 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
             if target_suit in suits_in_result:
                 status = f'✅{awaiting}️⃣'
                 await update_prediction_message(original_game, status, True, awaiting)
+                # METTRE À JOUR L'HISTORIQUE
+                final_status = f'gagne_r{awaiting}'
+                update_prediction_in_history(original_game, target_suit, game_number, first_group, awaiting, final_status)
                 return True
             else:
                 if awaiting < 2:
@@ -330,6 +426,8 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
                 else:
                     logger.info(f"❌ R2 échoué, perdu")
                     await update_prediction_message(original_game, '❌', False)
+                    # METTRE À JOUR L'HISTORIQUE
+                    update_prediction_in_history(original_game, target_suit, game_number, first_group, 2, 'perdu')
                     return False
     
     return False
@@ -395,6 +493,9 @@ async def process_game_result(game_number: int, message_text: str):
     suits_in_first = get_suits_in_group(first_group)
     
     logger.info(f"📊 Jeu #{game_number}: {suits_in_first} dans '{first_group[:30]}...'")
+    
+    # AJOUTER À L'HISTORIQUE DES MESSAGES FINALISÉS
+    add_to_history(game_number, message_text, first_group, suits_in_first)
     
     # 1. Vérifier prédictions actives
     if await check_prediction_result(game_number, first_group):
@@ -526,6 +627,113 @@ async def perform_full_reset(reason: str):
 # COMMANDES ADMIN
 # ============================================================================
 
+async def cmd_history(event):
+    """Affiche l'historique des 5 derniers messages finalisés et prédictions."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    lines = [
+        "📜 **HISTORIQUE DES 5 DERNIERS MESSAGES FINALISÉS**",
+        "═══════════════════════════════════════",
+        ""
+    ]
+    
+    # Afficher les 5 derniers messages finalisés
+    recent_messages = finalized_messages_history[:5]
+    
+    if not recent_messages:
+        lines.append("❌ Aucun message dans l'historique")
+    else:
+        for i, msg in enumerate(recent_messages, 1):
+            time_str = msg['timestamp'].strftime('%H:%M:%S')
+            game_num = msg['game_number']
+            group = msg['first_group']
+            suits = ', '.join([SUIT_DISPLAY.get(s, s) for s in msg['suits_found']]) if msg['suits_found'] else 'Aucune'
+            
+            # Indicateur si ce message a servi à vérifier une prédiction
+            verif_indicator = ""
+            if msg['predictions_verified']:
+                verif_details = []
+                for v in msg['predictions_verified']:
+                    suit_display = SUIT_DISPLAY.get(v['suit'], v['suit'])
+                    if v['rattrapage_level'] == 0:
+                        verif_details.append(f"✅0️⃣ #{v['predicted_game']}{suit_display}")
+                    elif v['rattrapage_level'] == 1:
+                        verif_details.append(f"✅1️⃣ #{v['predicted_game']}{suit_display}")
+                    elif v['rattrapage_level'] == 2:
+                        verif_details.append(f"✅2️⃣ #{v['predicted_game']}{suit_display}")
+                verif_indicator = "\n   🔍 Vérification: " + " | ".join(verif_details)
+            
+            lines.append(
+                f"{i}. 🕐 `{time_str}` | **Jeu #{game_num}**\n"
+                f"   📝 `{group}`\n"
+                f"   🎨 Couleurs: {suits}{verif_indicator}"
+            )
+            lines.append("")
+    
+    # Afficher les prédictions récentes avec leurs vérifications
+    lines.append("🔮 **PRÉDICTIONS RÉCENTES**")
+    lines.append("───────────────────────────────────────")
+    
+    recent_predictions = prediction_history[:5]
+    
+    if not recent_predictions:
+        lines.append("❌ Aucune prédiction dans l'historique")
+    else:
+        for pred in recent_predictions:
+            pred_game = pred['predicted_game']
+            suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+            status = pred['status']
+            pred_time = pred['predicted_at'].strftime('%H:%M:%S')
+            
+            # Statut formaté
+            if status == 'en_cours':
+                status_str = "⏳ En cours..."
+            elif status == 'gagne_r0':
+                status_str = "✅0️⃣ GAGNÉ direct"
+            elif status == 'gagne_r1':
+                status_str = "✅1️⃣ GAGNÉ R1"
+            elif status == 'gagne_r2':
+                status_str = "✅2️⃣ GAGNÉ R2"
+            elif status == 'perdu':
+                status_str = "❌ PERDU"
+            else:
+                status_str = f"❓ {status}"
+            
+            lines.append(f"🎯 **#{pred_game}** {suit} | {status_str}")
+            lines.append(f"   🕐 Prédit à: {pred_time}")
+            
+            # Afficher les messages de vérification
+            if pred['verified_by']:
+                lines.append("   📋 Vérifié par:")
+                for v in pred['verified_by']:
+                    r_text = f"R{v['rattrapage_level']}" if v['rattrapage_level'] > 0 else "Direct"
+                    lines.append(f"      • Jeu #{v['game_number']} ({r_text}): `{v['first_group']}`")
+            else:
+                # Montrer quels jeux doivent vérifier
+                verif_games = pred['verification_games']
+                if status == 'en_cours':
+                    pending_games = [g for g in verif_games if g > current_game_number]
+                    checked_games = [g for g in verif_games if g <= current_game_number]
+                    
+                    if checked_games:
+                        lines.append(f"   ✅ Déjà vérifié: {', '.join(['#' + str(g) for g in checked_games])}")
+                    if pending_games:
+                        lines.append(f"   ⏳ En attente: {', '.join(['#' + str(g) for g in pending_games])}")
+            
+            lines.append("")
+    
+    lines.append("═══════════════════════════════════════")
+    lines.append("💡 **Légende:**")
+    lines.append("• Messages finalisés = ✅ contenant #N[numéro]")
+    lines.append("• 1er groupe = Contenu entre premières parenthèses")
+    lines.append("• Prédiction créée quand compteur atteint le nombre de tours")
+    
+    await event.respond("\n".join(lines))
+
 async def cmd_status(event):
     """Affiche les compteurs détaillés."""
     if event.is_group or event.is_channel:
@@ -621,12 +829,13 @@ async def cmd_help(event):
 
 • Tour 1: vérifie cycle, cycle+1, cycle+2
 • Tour 2: vérifie next_cycle, next_cycle+1, next_cycle+2
-→ Si 2 tours sans trouver = PRÉDICTION
+→ Si {CONSECUTIVE_FAILURES_NEEDED} tour(s) sans trouver = PRÉDICTION
 
 **Rattrapages:** ✅0️⃣ ✅1️⃣ ✅2️⃣ ❌
 
 **Commandes:**
 /status - Voir les compteurs
+/history - Voir l'historique des messages et prédictions
 /set_tours [1-3] - Changer tours
 /reset - Reset manuel
 /channels - Config canaux
@@ -804,6 +1013,7 @@ async def cmd_announce(event):
 def setup_handlers():
     """Configure les handlers."""
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
+    client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
     client.add_event_handler(cmd_channels, events.NewMessage(pattern=r'^/channels$'))
