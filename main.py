@@ -32,7 +32,7 @@ if not API_ID or API_ID == 0:
 if not API_HASH: 
     logger.error("API_HASH manquant")
     exit(1)
-if not API_TOKEN: 
+if not BOT_TOKEN:  # ✅ CORRIGÉ : API_TOKEN → BOT_TOKEN
     logger.error("BOT_TOKEN manquant")
     exit(1)
 
@@ -665,16 +665,18 @@ async def perform_full_reset(reason: str):
         logger.error(f"❌ Notif reset failed: {e}")
 
 # ============================================================================
-# COMMANDES ADMIN
+# COMMANDES ADMIN - CORRIGÉES
 # ============================================================================
 
 async def cmd_redirect(event):
     """Gère la redirection des prédictions vers d'autres canaux."""
-    if event.is_group or event.is_channel:
-        return
+    # ✅ CORRIGÉ : Vérifier admin d'abord, pas de blocage par type de chat
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
+    
+    # Debug log pour voir si la commande arrive
+    logger.info(f"📨 Commande /redirect reçue de {event.sender_id}: {event.message.message}")
     
     global REDIRECTION_CHANNELS
     
@@ -777,8 +779,7 @@ PLAYER : TEST ♠️ : TEST EN COURS...."""
 
 async def cmd_history(event):
     """Affiche l'historique des 5 derniers messages finalisés et prédictions."""
-    if event.is_group or event.is_channel:
-        return
+    # ✅ CORRIGÉ : Vérifier admin uniquement
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
@@ -878,8 +879,7 @@ async def cmd_history(event):
 
 async def cmd_status(event):
     """Affiche les compteurs détaillés."""
-    if event.is_group or event.is_channel:
-        return
+    # ✅ CORRIGÉ : Vérifier admin uniquement
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
@@ -965,9 +965,7 @@ async def cmd_status(event):
 
 async def cmd_help(event):
     """Affiche l'aide."""
-    if event.is_group or event.is_channel:
-        return
-    
+    # ✅ CORRIGÉ : Pas de vérification de groupe, aide disponible partout
     help_text = f"""📖 **BACCARAT AI - AIDE**
 
 **Système ({NUMBERS_PER_TOUR} numéros/tour, {CONSECUTIVE_FAILURES_NEEDED} tours):**
@@ -998,8 +996,7 @@ async def cmd_help(event):
 
 async def cmd_reset(event):
     """Reset manuel."""
-    if event.is_group or event.is_channel:
-        return
+    # ✅ CORRIGÉ : Vérifier admin uniquement
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
@@ -1010,8 +1007,7 @@ async def cmd_reset(event):
 
 async def cmd_set_tours(event):
     """Change le nombre de tours."""
-    if event.is_group or event.is_channel:
-        return
+    # ✅ CORRIGÉ : Vérifier admin uniquement
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
@@ -1043,8 +1039,7 @@ async def cmd_set_tours(event):
 
 async def cmd_channels(event):
     """Affiche la config."""
-    if event.is_group or event.is_channel:
-        return
+    # ✅ CORRIGÉ : Vérifier admin uniquement
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
@@ -1093,46 +1088,53 @@ async def cmd_channels(event):
     await event.respond(msg)
 
 async def cmd_test(event):
-    """Test d'envoi."""
-    if event.is_group or event.is_channel:
-        return
+    """Test d'envoi - ENVOIE VRAIMENT DANS LE CANAL PRÉDICTION."""
+    # ✅ CORRIGÉ : Vérifier admin uniquement
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
     
-    await event.respond("🧪 Test...")
+    await event.respond("🧪 Test en cours...")
     
     try:
         if not PREDICTION_CHANNEL_ID:
-            await event.respond("❌ Canal non configuré")
+            await event.respond("❌ Canal prédiction non configuré (PREDICTION_CHANNEL_ID)")
             return
         
-        test_msg = """⏳BACCARAT AI 🤖⏳ [TEST]
+        # ✅ NOUVEAU : Envoie une vraie prédiction test dans le canal
+        test_game_number = 99999
+        test_suit = '♠'
+        
+        # Envoyer la prédiction test
+        test_msg = f"""⏳BACCARAT AI 🤖⏳ [TEST]
 
-PLAYER : 9999 ♠️ : TEST EN COURS...."""
+PLAYER : {test_game_number} {SUIT_DISPLAY.get(test_suit, test_suit)} : TEST EN COURS...."""
         
         sent = await client.send_message(PREDICTION_CHANNEL_ID, test_msg)
-        await asyncio.sleep(2)
+        logger.info(f"✅ Test envoyé au canal {PREDICTION_CHANNEL_ID}, msg_id: {sent.id}")
         
-        await client.edit_message(
-            PREDICTION_CHANNEL_ID,
-            sent.id,
-            """⏳BACCARAT AI 🤖⏳ [TEST]
+        # Attendre 3 secondes puis mettre à jour comme gagné
+        await asyncio.sleep(3)
+        
+        result_msg = f"""⏳BACCARAT AI 🤖⏳ [TEST]
 
-PLAYER : 9999 ♠️ : ✅0️⃣ TEST OK"""
-        )
-        await asyncio.sleep(1)
+PLAYER : {test_game_number} {SUIT_DISPLAY.get(test_suit, test_suit)} : ✅0️⃣ TEST RÉUSSI"""
+        
+        await client.edit_message(PREDICTION_CHANNEL_ID, sent.id, result_msg)
+        
+        # Attendre 2 secondes puis supprimer
+        await asyncio.sleep(2)
         await client.delete_messages(PREDICTION_CHANNEL_ID, [sent.id])
         
-        await event.respond("✅ **TEST RÉUSSI**")
+        await event.respond(f"✅ **TEST RÉUSSI**\n\nMessage envoyé au canal `{PREDICTION_CHANNEL_ID}`, modifié et supprimé.\n\nLe système fonctionne correctement !")
         
     except Exception as e:
-        await event.respond(f"❌ Échec: {e}")
+        logger.error(f"❌ Erreur test: {e}")
+        await event.respond(f"❌ Échec du test: {e}\n\nVérifiez que:\n1. PREDICTION_CHANNEL_ID est correct\n2. Le bot est admin du canal\n3. Le canal existe")
 
 async def cmd_announce(event):
     """Annonce personnalisée."""
-    if event.is_group or event.is_channel:
-        return
+    # ✅ CORRIGÉ : Vérifier admin uniquement
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
@@ -1176,9 +1178,10 @@ async def cmd_announce(event):
 
 def setup_handlers():
     """Configure les handlers."""
+    # Commandes admin - ordre important
+    client.add_event_handler(cmd_redirect, events.NewMessage(pattern=r'^/redirect'))
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
-    client.add_event_handler(cmd_redirect, events.NewMessage(pattern=r'^/redirect'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
     client.add_event_handler(cmd_channels, events.NewMessage(pattern=r'^/channels$'))
@@ -1186,6 +1189,7 @@ def setup_handlers():
     client.add_event_handler(cmd_set_tours, events.NewMessage(pattern=r'^/set_tours'))
     client.add_event_handler(cmd_announce, events.NewMessage(pattern=r'^/announce'))
     
+    # Messages du canal source
     client.add_event_handler(handle_new_message, events.NewMessage())
     client.add_event_handler(handle_edited_message, events.MessageEdited())
 
@@ -1207,7 +1211,7 @@ async def start_bot():
                 prediction_channel_ok = True
                 logger.info("✅ Canal prédition OK")
             except Exception as e:
-                logger.error(f"❌ Canal prédiction: {e}")
+                logger.error(f"❌ Canal prédition: {e}")
         
         logger.info("🤖 Bot démarré")
         return True
