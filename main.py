@@ -11,17 +11,12 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from aiohttp import web
 
-# Configuration importée depuis config.py
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
     SOURCE_CHANNEL_ID, PREDICTION_CHANNEL_ID, PORT,
     SUIT_CYCLES, ALL_SUITS, SUIT_DISPLAY,
     CONSECUTIVE_FAILURES_NEEDED, NUMBERS_PER_TOUR
 )
-
-# ============================================================================
-# CONFIGURATION LOGGING
-# ============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,14 +25,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Vérification des variables critiques
-if not API_ID or API_ID == 0:
+if not API_ID or API_ID == 0: 
     logger.error("API_ID manquant")
     exit(1)
-if not API_HASH:
+if not API_HASH: 
     logger.error("API_HASH manquant")
     exit(1)
-if not BOT_TOKEN:
+if not BOT_TOKEN: 
     logger.error("BOT_TOKEN manquant")
     exit(1)
 
@@ -46,7 +40,6 @@ if not BOT_TOKEN:
 # ============================================================================
 
 cycle_trackers: Dict[str, 'SuitCycleTracker'] = {}
-game_history: Dict[int, List[str]] = {}
 pending_predictions: Dict[int, dict] = {}
 current_game_number = 0
 last_source_game_number = 0
@@ -73,7 +66,6 @@ class SuitCycleTracker:
     last_cycle_index: int = -1
     
     def get_display_name(self) -> str:
-        """Retourne le nom d'affichage de la couleur."""
         names = {
             '♠': '♠️ Pique',
             '♥': '❤️ Cœur',
@@ -82,12 +74,42 @@ class SuitCycleTracker:
         }
         return names.get(self.suit, self.suit)
     
+    def update_to_current_game(self, game_number: int):
+        """
+        Met à jour le last_cycle_index pour pointer sur le bon cycle
+        par rapport au numéro de jeu actuel.
+        """
+        # Trouver le dernier cycle <= game_number
+        new_index = -1
+        for i, cycle_num in enumerate(self.cycle_numbers):
+            if cycle_num <= game_number:
+                new_index = i
+            else:
+                break
+        
+        if new_index != self.last_cycle_index and new_index >= 0:
+            # On a avancé dans les cycles
+            old_cycle = self.cycle_numbers[self.last_cycle_index] if self.last_cycle_index >= 0 else 'N/A'
+            new_cycle = self.cycle_numbers[new_index]
+            logger.info(f"🔄 {self.suit} avance: cycle #{old_cycle} → #{new_cycle} (jeu #{game_number})")
+            
+            # Si on change de cycle, reset le tour en cours
+            if self.last_cycle_index >= 0 and new_index > self.last_cycle_index:
+                # On passe à un nouveau cycle, reset les compteurs
+                self.tour_checked_numbers.clear()
+                self.verification_history.clear()
+                # Ne pas reset miss_counter si on est en plein tour
+                if self.current_tour == 1:
+                    self.miss_counter = 0
+            
+            self.last_cycle_index = new_index
+    
     def get_current_cycle_target(self) -> Optional[int]:
         """Retourne le numéro de cycle actuel."""
         if self.last_cycle_index >= 0 and self.last_cycle_index < len(self.cycle_numbers):
             return self.cycle_numbers[self.last_cycle_index]
         
-        # Trouver le premier numéro >= current_game_number
+        # Initialisation - trouver le premier cycle
         for i, num in enumerate(self.cycle_numbers):
             if num >= current_game_number:
                 self.last_cycle_index = max(0, i - 1)
@@ -113,15 +135,17 @@ class SuitCycleTracker:
     
     def is_number_in_current_tour(self, game_number: int) -> bool:
         """Vérifie si le numéro fait partie du tour actuel."""
+        # D'abord mettre à jour si nécessaire
+        self.update_to_current_game(game_number)
         return game_number in self.get_numbers_to_check_this_tour()
     
     def process_verification(self, game_number: int, suit_found: bool) -> Optional[int]:
         """
         Traite la vérification d'un numéro.
-        Tour 1: vérifie 3 numéros (cycle, +1, +2)
-        Tour 2: vérifie 3 numéros (next_cycle, +1, +2)
-        Si 2 tours complets sans trouver → prédiction
         """
+        # Mettre à jour le cycle en fonction du jeu actuel
+        self.update_to_current_game(game_number)
+        
         # Vérifier si ce numéro est dans le tour actuel
         if not self.is_number_in_current_tour(game_number):
             return None
@@ -180,9 +204,17 @@ class SuitCycleTracker:
         self.tour_checked_numbers.clear()
         self.verification_history.clear()
 
-# ============================================================================
-# FONCTIONS UTILITAIRES
-# ============================================================================
+def initialize_trackers(max_game: int = 3000):
+    """Initialise les trackers pour chaque couleur."""
+    global cycle_trackers
+    
+    for suit, config in SUIT_CYCLES.items():
+        start = config['start']
+        interval = config['interval']
+        cycle_nums = list(range(start, max_game + 1, interval))
+        
+        cycle_trackers[suit] = SuitCycleTracker(suit=suit, cycle_numbers=cycle_nums)
+        logger.info(f"📊 {suit}: cycle +{interval}, {len(cycle_nums)} numéros (1 à {max(cycle_nums)})")
 
 def is_message_finalized(message: str) -> bool:
     """Vérifie si le message est finalisé (contient ✅ ou 🔰)."""
@@ -214,18 +246,6 @@ def get_suits_in_group(group_str: str) -> List[str]:
     
     return [suit for suit in ALL_SUITS if suit in normalized]
 
-def initialize_trackers(max_game: int = 3000):
-    """Initialise les trackers pour chaque couleur."""
-    global cycle_trackers
-    
-    for suit, config in SUIT_CYCLES.items():
-        start = config['start']
-        interval = config['interval']
-        cycle_nums = list(range(start, max_game + 1, interval))
-        
-        cycle_trackers[suit] = SuitCycleTracker(suit=suit, cycle_numbers=cycle_nums)
-        logger.info(f"📊 {suit}: cycle +{interval}, {len(cycle_nums)} numéros")
-
 def block_suit(suit: str, minutes: int = 5):
     """Bloque une couleur."""
     suit_block_until[suit] = datetime.now() + timedelta(minutes=minutes)
@@ -240,7 +260,6 @@ async def send_prediction(game_number: int, suit: str, is_rattrapage: int = 0) -
     global last_prediction_time
     
     try:
-        # Vérifier blocage
         if suit in suit_block_until and datetime.now() < suit_block_until[suit]:
             logger.info(f"🔒 {suit} bloqué")
             return None
@@ -324,7 +343,6 @@ async def update_prediction_message(game_number: int, status: str, trouve: bool,
     suit = pred['suit']
     msg_id = pred['message_id']
     
-    # Construction du message résultat
     if status == '✅0️⃣':
         result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅0️⃣ GAGNÉ"
     elif status == '✅1️⃣':
@@ -364,6 +382,10 @@ async def process_game_result(game_number: int, message_text: str):
     current_game_number = game_number
     last_source_game_number = game_number
     
+    # Mettre à jour tous les trackers pour suivre le numéro actuel
+    for tracker in cycle_trackers.values():
+        tracker.update_to_current_game(game_number)
+    
     groups = extract_parentheses_groups(message_text)
     if not groups:
         logger.warning(f"⚠️ Pas de groupe trouvé dans #{game_number}")
@@ -390,7 +412,6 @@ async def handle_message(event, is_edit: bool = False):
         chat = await event.get_chat()
         chat_id = chat.id
         
-        # Normalisation ID canal
         if hasattr(chat, 'broadcast') and chat.broadcast:
             if not str(chat_id).startswith('-100'):
                 chat_id = int(f"-100{abs(chat_id)}")
@@ -400,11 +421,9 @@ async def handle_message(event, is_edit: bool = False):
         
         message_text = event.message.message
         edit_info = " [EDITÉ]" if is_edit else ""
-        logger.info(f"📨{edit_info} #{event.message.id}: {message_text[:50]}...")
+        logger.info(f"📨{edit_info} Msg {event.message.id}: {message_text[:60]}...")
         
-        # Vérifier si finalisé
         if not is_message_finalized(message_text):
-            # Si en cours avec ⏰, stocker pour suivi
             if '⏰' in message_text:
                 match = re.search(r"#N\s*(\d+)", message_text, re.IGNORECASE)
                 if match:
@@ -415,7 +434,6 @@ async def handle_message(event, is_edit: bool = False):
             logger.info(f"⏳ Non finalisé ignoré")
             return
         
-        # Message finalisé
         match = re.search(r"#N\s*(\d+)", message_text, re.IGNORECASE)
         if not match:
             match = re.search(r"(?:^|[^\d])(\d{3,4})(?:[^\d]|$)", message_text)
@@ -426,7 +444,6 @@ async def handle_message(event, is_edit: bool = False):
         
         game_number = int(match.group(1))
         
-        # Nettoyer waiting si présent
         if game_number in waiting_finalization:
             del waiting_finalization[game_number]
         
@@ -455,13 +472,11 @@ async def auto_reset_system():
         try:
             now = datetime.now()
             
-            # Reset à 1h00 (heure Bénin UTC+1)
             if now.hour == 1 and now.minute == 0:
                 logger.info("🕐 Reset 1h00")
                 await perform_full_reset("🕐 Reset automatique 1h00")
                 await asyncio.sleep(60)
             
-            # Reset après 1h d'inactivité
             if last_prediction_time:
                 elapsed = now - last_prediction_time
                 if elapsed > timedelta(hours=1) and pending_predictions:
@@ -478,14 +493,11 @@ async def perform_full_reset(reason: str):
     """Effectue un reset complet."""
     global pending_predictions, last_prediction_time, waiting_finalization
     
-    # Stats avant reset
     stats = len(pending_predictions)
     
-    # Reset trackers
     for tracker in cycle_trackers.values():
         tracker.reset()
     
-    # Clear structures
     pending_predictions.clear()
     waiting_finalization.clear()
     last_prediction_time = None
@@ -493,7 +505,6 @@ async def perform_full_reset(reason: str):
     
     logger.info(f"🔄 {reason} - {stats} prédictions cleared")
     
-    # Notification
     try:
         if PREDICTION_CHANNEL_ID and client and client.is_connected():
             await client.send_message(
@@ -537,15 +548,17 @@ async def cmd_status(event):
             continue
         
         tracker = cycle_trackers[suit]
+        
+        # Forcer la mise à jour au numéro actuel
+        tracker.update_to_current_game(current_game_number)
+        
         current = tracker.get_current_cycle_target()
         to_check = tracker.get_numbers_to_check_this_tour()
         checked = tracker.tour_checked_numbers
         
-        # Progression
         progress = len(checked)
         bar = f"[{'█' * progress}{'░' * (NUMBERS_PER_TOUR - progress)}]"
         
-        # Status
         if tracker.pending_prediction:
             emoji, status = "🔮", f"PRÉDICTION #{tracker.pending_prediction}"
         elif tracker.current_tour == 2:
@@ -555,7 +568,6 @@ async def cmd_status(event):
         else:
             emoji, status = "✅", "En attente"
         
-        # Numéros avec indicateurs
         nums = []
         for n in to_check:
             if n in checked:
@@ -575,7 +587,6 @@ async def cmd_status(event):
             ""
         ])
     
-    # Prédictions actives
     if pending_predictions:
         lines.append("**🔮 PRÉDICTIONS ACTIVES:**")
         for num, pred in sorted(pending_predictions.items()):
@@ -608,19 +619,19 @@ async def cmd_help(event):
 
 **Système ({NUMBERS_PER_TOUR} numéros/tour, {CONSECUTIVE_FAILURES_NEEDED} tours):**
 
-Tour 1: vérifie cycle, cycle+1, cycle+2
-Tour 2: vérifie next_cycle, next_cycle+1, next_cycle+2
+• Tour 1: vérifie cycle, cycle+1, cycle+2
+• Tour 2: vérifie next_cycle, next_cycle+1, next_cycle+2
 → Si 2 tours sans trouver = PRÉDICTION
 
 **Rattrapages:** ✅0️⃣ ✅1️⃣ ✅2️⃣ ❌
 
 **Commandes:**
 /status - Voir les compteurs
-/set_tours [1-3] - Changer nombre de tours
-/reset - Reset manuel immédiat
-/channels - Voir config canaux
-/test - Test envoi prédiction
-/announce [msg] - Annonce personnalisée
+/set_tours [1-3] - Changer tours
+/reset - Reset manuel
+/channels - Config canaux
+/test - Test envoi
+/announce [msg] - Annonce
 /help - Cette aide
 
 ⏳BACCARAT AI 🤖⏳"""
@@ -673,15 +684,14 @@ async def cmd_set_tours(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_channels(event):
-    """Affiche la config des canaux."""
+    """Affiche la config."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
     
-    src_status = "❌"
-    pred_status = "❌"
+    src_status = pred_status = "❌"
     
     try:
         if SOURCE_CHANNEL_ID:
@@ -704,40 +714,33 @@ async def cmd_channels(event):
 **Admin:** `{ADMIN_ID}`
 **Port:** `{PORT}`
 
-**Cycles:**
-♠️ +5 | ❤️ +6 | ♦️ +6 | ♣️ +7
-
-**Paramètres:**
-Tours: {CONSECUTIVE_FAILURES_NEEDED}
-Numéros/tour: {NUMBERS_PER_TOUR}"""
+**Cycles:** ♠️+5 ❤️+6 ♦️+6 ♣️+7
+**Paramètres:** {CONSECUTIVE_FAILURES_NEEDED} tours, {NUMBERS_PER_TOUR} num/tour"""
     
     await event.respond(msg)
 
 async def cmd_test(event):
-    """Test d'envoi de prédiction."""
+    """Test d'envoi."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
     
-    await event.respond("🧪 Test en cours...")
+    await event.respond("🧪 Test...")
     
     try:
         if not PREDICTION_CHANNEL_ID:
             await event.respond("❌ Canal non configuré")
             return
         
-        # Test envoi
         test_msg = """⏳BACCARAT AI 🤖⏳ [TEST]
 
 PLAYER : 9999 ♠️ : TEST EN COURS...."""
         
         sent = await client.send_message(PREDICTION_CHANNEL_ID, test_msg)
-        
         await asyncio.sleep(2)
         
-        # Test update
         await client.edit_message(
             PREDICTION_CHANNEL_ID,
             sent.id,
@@ -745,24 +748,16 @@ PLAYER : 9999 ♠️ : TEST EN COURS...."""
 
 PLAYER : 9999 ♠️ : ✅0️⃣ TEST OK"""
         )
-        
         await asyncio.sleep(1)
         await client.delete_messages(PREDICTION_CHANNEL_ID, [sent.id])
         
-        await event.respond("""✅ **TEST RÉUSSI**
-
-Envoi: ✅
-Modification: ✅
-Suppression: ✅
-
-Le système fonctionne!""")
+        await event.respond("✅ **TEST RÉUSSI**")
         
     except Exception as e:
         await event.respond(f"❌ Échec: {e}")
-        logger.error(f"Test failed: {e}")
 
 async def cmd_announce(event):
-    """Envoie une annonce."""
+    """Annonce personnalisée."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -806,13 +801,8 @@ async def cmd_announce(event):
     except Exception as e:
         await event.respond(f"❌ Erreur: {e}")
 
-# ============================================================================
-# SETUP HANDLERS
-# ============================================================================
-
 def setup_handlers():
-    """Configure tous les handlers."""
-    # Commandes
+    """Configure les handlers."""
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
@@ -821,13 +811,8 @@ def setup_handlers():
     client.add_event_handler(cmd_set_tours, events.NewMessage(pattern=r'^/set_tours'))
     client.add_event_handler(cmd_announce, events.NewMessage(pattern=r'^/announce'))
     
-    # Messages source (nouveaux et édités)
     client.add_event_handler(handle_new_message, events.NewMessage())
     client.add_event_handler(handle_edited_message, events.MessageEdited())
-
-# ============================================================================
-# DÉMARRAGE
-# ============================================================================
 
 async def start_bot():
     """Démarre le bot."""
@@ -841,16 +826,15 @@ async def start_bot():
         setup_handlers()
         initialize_trackers(3000)
         
-        # Vérifier canal prédiction
         if PREDICTION_CHANNEL_ID:
             try:
                 await client.get_entity(PREDICTION_CHANNEL_ID)
                 prediction_channel_ok = True
-                logger.info("✅ Canal prédiction OK")
+                logger.info("✅ Canal prédition OK")
             except Exception as e:
-                logger.error(f"❌ Canal prédiction inaccessible: {e}")
+                logger.error(f"❌ Canal prédiction: {e}")
         
-        logger.info("🤖 Bot démarré avec succès")
+        logger.info("🤖 Bot démarré")
         return True
         
     except Exception as e:
@@ -861,14 +845,12 @@ async def main():
     """Fonction principale."""
     try:
         if not await start_bot():
-            logger.error("Arrêt - échec démarrage")
             return
         
-        # Démarrer reset automatique
         asyncio.create_task(auto_reset_system())
         logger.info("🔄 Auto-reset démarré")
         
-        # Serveur web pour Render (port 10000)
+        # Serveur web Render
         app = web.Application()
         app.router.add_get('/health', lambda r: web.Response(text="OK"))
         app.router.add_get('/', lambda r: web.Response(text="BACCARAT AI 🤖 Running"))
@@ -879,11 +861,9 @@ async def main():
         site = web.TCPSite(runner, '0.0.0.0', PORT)
         await site.start()
         
-        logger.info(f"🌐 Serveur web démarré sur port {PORT}")
-        logger.info(f"   Health check: http://0.0.0.0:{PORT}/health")
-        logger.info(f"📊 Config: {NUMBERS_PER_TOUR} numéros/tour, {CONSECUTIVE_FAILURES_NEEDED} tours")
+        logger.info(f"🌐 Web server port {PORT}")
+        logger.info(f"📊 {NUMBERS_PER_TOUR} num/tour, {CONSECUTIVE_FAILURES_NEEDED} tours")
         
-        # Maintenir le bot actif
         await client.run_until_disconnected()
         
     except Exception as e:
@@ -897,7 +877,7 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Arrêté par utilisateur")
+        logger.info("Arrêté")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal: {e}")
         sys.exit(1)
