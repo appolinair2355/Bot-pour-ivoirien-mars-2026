@@ -4,6 +4,7 @@ import asyncio
 import re
 import logging
 import sys
+import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set
 from datetime import datetime, timedelta
@@ -31,7 +32,7 @@ if not API_ID or API_ID == 0:
 if not API_HASH: 
     logger.error("API_HASH manquant")
     exit(1)
-if not BOT_TOKEN: 
+if not API_TOKEN: 
     logger.error("BOT_TOKEN manquant")
     exit(1)
 
@@ -53,6 +54,9 @@ waiting_finalization: Dict[int, dict] = {}
 finalized_messages_history: List[Dict] = []
 MAX_HISTORY_SIZE = 50
 prediction_history: List[Dict] = []
+
+# NOUVEAU : Canaux de redirection pour les prédictions
+REDIRECTION_CHANNELS: List[int] = []  # Liste des IDs de canaux pour redirection
 
 # ============================================================================
 # CLASSES
@@ -93,18 +97,9 @@ class SuitCycleTracker:
                 break
         
         if new_index != self.last_cycle_index and new_index >= 0:
-            # On a avancé dans les cycles
             old_cycle = self.cycle_numbers[self.last_cycle_index] if self.last_cycle_index >= 0 else 'N/A'
             new_cycle = self.cycle_numbers[new_index]
             logger.info(f"🔄 {self.suit} avance: cycle #{old_cycle} → #{new_cycle} (jeu #{game_number})")
-            
-            # Si on change de cycle et qu'on n'est pas en plein suivi, reset
-            if self.last_cycle_index >= 0 and new_index > self.last_cycle_index:
-                # Seulement si on n'a pas de prédiction en attente et pas en cours d'analyse
-                if self.miss_counter == 0 and self.current_tour == 1:
-                    self.tour_checked_numbers.clear()
-                    self.verification_history.clear()
-            
             self.last_cycle_index = new_index
     
     def get_current_cycle_target(self) -> Optional[int]:
@@ -112,7 +107,6 @@ class SuitCycleTracker:
         if self.last_cycle_index >= 0 and self.last_cycle_index < len(self.cycle_numbers):
             return self.cycle_numbers[self.last_cycle_index]
         
-        # Initialisation - trouver le premier cycle
         for i, num in enumerate(self.cycle_numbers):
             if num >= current_game_number:
                 self.last_cycle_index = max(0, i - 1)
@@ -126,13 +120,11 @@ class SuitCycleTracker:
         Tour 2: cycle suivant, cycle_suivant+1, cycle_suivant+2
         """
         if self.current_tour == 1:
-            # Tour 1: base sur le cycle actuel
             current_cycle = self.get_current_cycle_target()
             if current_cycle is None:
                 return []
             return [current_cycle, current_cycle + 1, current_cycle + 2]
         else:
-            # Tour 2: base sur le cycle suivant
             next_idx = self.last_cycle_index + 1
             if next_idx < len(self.cycle_numbers):
                 next_cycle = self.cycle_numbers[next_idx]
@@ -141,23 +133,23 @@ class SuitCycleTracker:
     
     def is_number_in_current_tour(self, game_number: int) -> bool:
         """Vérifie si le numéro fait partie du tour actuel."""
-        # D'abord mettre à jour si nécessaire
         self.update_to_current_game(game_number)
         return game_number in self.get_numbers_to_check_this_tour()
     
     def process_verification(self, game_number: int, suit_found: bool) -> Optional[int]:
         """
         Traite la vérification d'un numéro.
-        Retourne le numéro de prédiction si une prédiction doit être créée.
+        NOUVELLE LOGIQUE:
+        - Tour 1 trouvé → Reset complet, prochain cycle = nouveau Tour 1
+        - Tour 1 manqué → Passe Tour 2 (vérifie cycle suivant)
+        - Tour 2 trouvé → Reset compteur, MAIS prochain cycle = nouveau Tour 1 (pas reset complet!)
+        - Tour 2 manqué → Prédiction
         """
-        # Mettre à jour le cycle en fonction du jeu actuel
         self.update_to_current_game(game_number)
         
-        # Vérifier si ce numéro est dans le tour actuel
         if not self.is_number_in_current_tour(game_number):
             return None
         
-        # Éviter les doublons
         if game_number in self.tour_checked_numbers:
             return None
         
@@ -165,8 +157,16 @@ class SuitCycleTracker:
         self.verification_history[game_number] = suit_found
         
         if suit_found:
-            logger.info(f"✅ {self.suit} trouvé au jeu #{game_number} (Tour {self.current_tour}) - RESET")
-            self.reset()
+            logger.info(f"✅ {self.suit} trouvé au jeu #{game_number} (Tour {self.current_tour})")
+            
+            if self.current_tour == 1:
+                # Tour 1 trouvé → Reset complet, attendre prochain cycle
+                logger.info(f"🔄 {self.suit} Tour 1 trouvé → Reset complet, prochain cycle devient Tour 1")
+                self.reset()
+            else:
+                # Tour 2 trouvé → Reset compteur mais continue! Le prochain cycle devient Tour 1
+                logger.info(f"🔄 {self.suit} Tour 2 trouvé → Reset compteur, cycle suivant devient nouveau Tour 1")
+                self.reset_after_tour2_found()
             return None
         
         # Pas trouvé
@@ -175,15 +175,11 @@ class SuitCycleTracker:
         
         # Tour terminé (3 numéros vérifiés)
         if tour_misses >= NUMBERS_PER_TOUR:
-            # Incrémenter le compteur de manques (tours complétés sans trouver)
             self.miss_counter += 1
             logger.info(f"📊 {self.suit} Tour {self.current_tour} terminé - Manques: {self.miss_counter}/{CONSECUTIVE_FAILURES_NEEDED}")
             
-            # VÉRIFICATION: Assez de manques pour prédire ?
+            # Assez de manques pour prédire?
             if self.miss_counter >= CONSECUTIVE_FAILURES_NEEDED:
-                # PRÉDICTION: jouer au cycle après le dernier vérifié
-                # Si Tour 1 échoué → prédire cycle+1 (prochain cycle)
-                # Si Tour 1+2 échoués → prédire cycle d'après le tour 2
                 pred_idx = self.last_cycle_index + self.miss_counter
                 if pred_idx < len(self.cycle_numbers):
                     pred_num = self.cycle_numbers[pred_idx]
@@ -192,27 +188,37 @@ class SuitCycleTracker:
                     self.reset_after_prediction()
                     return pred_num
             
-            # Passer au tour suivant (s'il reste des tours à faire)
+            # Passer au tour suivant
             if self.current_tour < CONSECUTIVE_FAILURES_NEEDED:
                 self.current_tour += 1
                 self.tour_checked_numbers.clear()
-                # Avancer l'index pour le prochain tour (Tour 2 utilise le cycle suivant)
-                self.last_cycle_index += 1
+                self.last_cycle_index += 1  # Avance au cycle suivant pour Tour 2
                 logger.info(f"🔄 {self.suit} passe au Tour {self.current_tour} (cycle suivant)")
             else:
-                # On a fait tous les tours nécessaires mais pas de prédition ?
                 logger.warning(f"⚠️ {self.suit} tous tours terminés mais pas de prédiction")
                 self.reset()
         
         return None
     
     def reset(self):
-        """Reset complet."""
+        """Reset complet - quand Tour 1 trouvé."""
         self.current_tour = 1
         self.miss_counter = 0
         self.tour_checked_numbers.clear()
         self.pending_prediction = None
         self.verification_history.clear()
+    
+    def reset_after_tour2_found(self):
+        """
+        Reset après avoir trouvé au Tour 2.
+        Le prochain cycle devient le nouveau Tour 1.
+        """
+        self.current_tour = 1
+        self.miss_counter = 0
+        self.tour_checked_numbers.clear()
+        self.verification_history.clear()
+        # On avance d'un cycle car on vient de finir le Tour 2 sur le cycle suivant
+        self.last_cycle_index += 1
     
     def reset_after_prediction(self):
         """Reset après création d'une prédiction."""
@@ -264,7 +270,6 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
     """Met à jour l'historique quand une prédiction est vérifiée."""
     global finalized_messages_history, prediction_history
     
-    # Mettre à jour la prédiction
     for pred in prediction_history:
         if pred['predicted_game'] == game_number and pred['suit'] == suit:
             pred['verified_by'].append({
@@ -276,7 +281,6 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
                 pred['status'] = final_status
             break
     
-    # Mettre à jour le message finalisé pour indiquer qu'il a servi à une vérif
     for msg in finalized_messages_history:
         if msg['game_number'] == verified_by_game:
             msg['predictions_verified'].append({
@@ -338,11 +342,26 @@ def block_suit(suit: str, minutes: int = 5):
     logger.info(f"🔒 {suit} bloqué {minutes}min")
 
 # ============================================================================
-# GESTION DES PRÉDICTIONS
+# GESTION DES PRÉDICTIONS ET REDIRECTION
 # ============================================================================
 
+async def send_prediction_to_channel(channel_id: int, game_number: int, suit: str, is_rattrapage: int = 0) -> Optional[int]:
+    """Envoie une prédiction à un canal spécifique."""
+    try:
+        msg = f"""⏳BACCARAT AI 🤖⏳
+
+PLAYER : {game_number} {SUIT_DISPLAY.get(suit, suit)} : en cours...."""
+        
+        sent = await client.send_message(channel_id, msg)
+        logger.info(f"✅ Prédiction envoyée à {channel_id}: #{game_number} {suit}")
+        return sent.id
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur envoi prédiction à {channel_id}: {e}")
+        return None
+
 async def send_prediction(game_number: int, suit: str, is_rattrapage: int = 0) -> Optional[int]:
-    """Envoie une prédiction."""
+    """Envoie une prédiction au canal principal et aux canaux de redirection."""
     global last_prediction_time
     
     try:
@@ -350,38 +369,76 @@ async def send_prediction(game_number: int, suit: str, is_rattrapage: int = 0) -
             logger.info(f"🔒 {suit} bloqué")
             return None
         
-        msg = f"""⏳BACCARAT AI 🤖⏳
-
-PLAYER : {game_number} {SUIT_DISPLAY.get(suit, suit)} : en cours...."""
-        
+        # Canal principal
         if not PREDICTION_CHANNEL_ID:
-            logger.warning("⚠️ Canal prédiction non configuré")
+            logger.warning("⚠️ Canal prédiction principal non configuré")
             return None
         
-        sent = await client.send_message(PREDICTION_CHANNEL_ID, msg)
-        last_prediction_time = datetime.now()
+        sent_main = await send_prediction_to_channel(PREDICTION_CHANNEL_ID, game_number, suit, is_rattrapage)
         
-        pending_predictions[game_number] = {
-            'suit': suit,
-            'message_id': sent.id,
-            'status': 'en_cours',
-            'rattrapage': is_rattrapage,
-            'original_game': game_number if is_rattrapage == 0 else None,
-            'awaiting_rattrapage': 0,
-            'sent_time': datetime.now()
-        }
+        if sent_main:
+            last_prediction_time = datetime.now()
+            
+            pending_predictions[game_number] = {
+                'suit': suit,
+                'message_id': sent_main,
+                'status': 'en_cours',
+                'rattrapage': is_rattrapage,
+                'original_game': game_number if is_rattrapage == 0 else None,
+                'awaiting_rattrapage': 0,
+                'sent_time': datetime.now(),
+                'redirected_to': []  # Stocke les IDs des messages redirigés
+            }
+            
+            # Redirection vers les autres canaux
+            if is_rattrapage == 0:  # Seulement pour les prédictions originales, pas les mises à jour
+                for redirect_channel_id in REDIRECTION_CHANNELS:
+                    try:
+                        sent_redirect = await send_prediction_to_channel(redirect_channel_id, game_number, suit, is_rattrapage)
+                        if sent_redirect:
+                            pending_predictions[game_number]['redirected_to'].append({
+                                'channel_id': redirect_channel_id,
+                                'message_id': sent_redirect
+                            })
+                    except Exception as e:
+                        logger.error(f"❌ Erreur redirection vers {redirect_channel_id}: {e}")
+            
+            # Ajouter à l'historique
+            if is_rattrapage == 0:
+                verification_games = [game_number, game_number + 1, game_number + 2]
+                add_prediction_to_history(game_number, suit, verification_games)
+            
+            logger.info(f"✅ Prédiction envoyée: #{game_number} {suit} (+{len(REDIRECTION_CHANNELS)} redirections)")
+            return sent_main
         
-        # AJOUTER À L'HISTORIQUE
-        if is_rattrapage == 0:
-            verification_games = [game_number, game_number + 1, game_number + 2]
-            add_prediction_to_history(game_number, suit, verification_games)
-        
-        logger.info(f"✅ Prédiction envoyée: #{game_number} {suit}")
-        return sent.id
+        return None
         
     except Exception as e:
         logger.error(f"❌ Erreur envoi prédiction: {e}")
         return None
+
+async def update_prediction_in_channel(channel_id: int, message_id: int, game_number: int, suit: str, status: str):
+    """Met à jour une prédiction dans un canal spécifique."""
+    try:
+        if status == '✅0️⃣':
+            result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅0️⃣ GAGNÉ"
+        elif status == '✅1️⃣':
+            result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅1️⃣ GAGNÉ"
+        elif status == '✅2️⃣':
+            result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅2️⃣ GAGNÉ"
+        else:
+            result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ❌ PERDU 😭"
+        
+        new_msg = f"""⏳BACCARAT AI 🤖⏳
+
+PLAYER : {game_number} {result_line}"""
+        
+        await client.edit_message(channel_id, message_id, new_msg)
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur update message dans {channel_id}: {e}")
+        return False
 
 async def check_prediction_result(game_number: int, first_group: str) -> bool:
     """Vérifie si une prédiction est gagnante."""
@@ -396,7 +453,6 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
             
             if target_suit in suits_in_result:
                 await update_prediction_message(game_number, '✅0️⃣', True)
-                # METTRE À JOUR L'HISTORIQUE
                 update_prediction_in_history(game_number, target_suit, game_number, first_group, 0, 'gagne_r0')
                 return True
             else:
@@ -414,7 +470,6 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
             if target_suit in suits_in_result:
                 status = f'✅{awaiting}️⃣'
                 await update_prediction_message(original_game, status, True, awaiting)
-                # METTRE À JOUR L'HISTORIQUE
                 final_status = f'gagne_r{awaiting}'
                 update_prediction_in_history(original_game, target_suit, game_number, first_group, awaiting, final_status)
                 return True
@@ -426,14 +481,13 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
                 else:
                     logger.info(f"❌ R2 échoué, perdu")
                     await update_prediction_message(original_game, '❌', False)
-                    # METTRE À JOUR L'HISTORIQUE
                     update_prediction_in_history(original_game, target_suit, game_number, first_group, 2, 'perdu')
                     return False
     
     return False
 
 async def update_prediction_message(game_number: int, status: str, trouve: bool, rattrapage: int = 0):
-    """Met à jour le statut d'une prédiction."""
+    """Met à jour le statut d'une prédiction dans tous les canaux."""
     if game_number not in pending_predictions:
         return
     
@@ -441,33 +495,22 @@ async def update_prediction_message(game_number: int, status: str, trouve: bool,
     suit = pred['suit']
     msg_id = pred['message_id']
     
-    if status == '✅0️⃣':
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅0️⃣ GAGNÉ"
-    elif status == '✅1️⃣':
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅1️⃣ GAGNÉ"
-    elif status == '✅2️⃣':
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅2️⃣ GAGNÉ"
+    # Mettre à jour le canal principal
+    await update_prediction_in_channel(PREDICTION_CHANNEL_ID, msg_id, game_number, suit, status)
+    
+    # Mettre à jour les canaux de redirection
+    for redirect in pred.get('redirected_to', []):
+        await update_prediction_in_channel(redirect['channel_id'], redirect['message_id'], game_number, suit, status)
+    
+    pred['status'] = status
+    
+    if trouve:
+        logger.info(f"✅ Gagné: #{game_number} {status}")
     else:
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ❌ PERDU 😭"
+        logger.info(f"❌ Perdu: #{game_number}")
+        block_suit(suit, 5)
     
-    new_msg = f"""⏳BACCARAT AI 🤖⏳
-
-PLAYER : {game_number} {result_line}"""
-    
-    try:
-        await client.edit_message(PREDICTION_CHANNEL_ID, msg_id, new_msg)
-        pred['status'] = status
-        
-        if trouve:
-            logger.info(f"✅ Gagné: #{game_number} {status}")
-        else:
-            logger.info(f"❌ Perdu: #{game_number}")
-            block_suit(suit, 5)
-        
-        del pending_predictions[game_number]
-        
-    except Exception as e:
-        logger.error(f"❌ Erreur update message: {e}")
+    del pending_predictions[game_number]
 
 # ============================================================================
 # TRAITEMENT DES MESSAGES
@@ -480,7 +523,6 @@ async def process_game_result(game_number: int, message_text: str):
     current_game_number = game_number
     last_source_game_number = game_number
     
-    # Mettre à jour tous les trackers pour suivre le numéro actuel
     for tracker in cycle_trackers.values():
         tracker.update_to_current_game(game_number)
     
@@ -494,7 +536,6 @@ async def process_game_result(game_number: int, message_text: str):
     
     logger.info(f"📊 Jeu #{game_number}: {suits_in_first} dans '{first_group[:30]}...'")
     
-    # AJOUTER À L'HISTORIQUE DES MESSAGES FINALISÉS
     add_to_history(game_number, message_text, first_group, suits_in_first)
     
     # 1. Vérifier prédictions actives
@@ -627,6 +668,113 @@ async def perform_full_reset(reason: str):
 # COMMANDES ADMIN
 # ============================================================================
 
+async def cmd_redirect(event):
+    """Gère la redirection des prédictions vers d'autres canaux."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    global REDIRECTION_CHANNELS
+    
+    message_text = event.message.message.strip()
+    parts = message_text.split()
+    
+    if len(parts) == 1:
+        # Afficher la liste actuelle
+        if not REDIRECTION_CHANNELS:
+            await event.respond("📭 Aucun canal de redirection configuré.\n\nUsage:\n`/redirect add -1001234567890`\n`/redirect remove -1001234567890`\n`/redirect list`")
+            return
+        
+        lines = ["📡 **CANAUX DE REDIRECTION**", f"Canal principal: `{PREDICTION_CHANNEL_ID}`", "", "**Canaux de redirection:**"]
+        for i, chan_id in enumerate(REDIRECTION_CHANNELS, 1):
+            lines.append(f"{i}. `{chan_id}`")
+        
+        lines.extend(["", f"**Total:** {len(REDIRECTION_CHANNELS)} canaux", "", "Commandes:", "`/redirect add [ID]` - Ajouter", "`/redirect remove [ID]` - Retirer", "`/redirect clear` - Vider la liste"])
+        await event.respond("\n".join(lines))
+        return
+    
+    subcommand = parts[1].lower()
+    
+    if subcommand == 'list':
+        if not REDIRECTION_CHANNELS:
+            await event.respond("📭 Liste vide")
+            return
+        
+        lines = ["📡 **LISTE DES REDIRECTIONS**", ""]
+        for i, chan_id in enumerate(REDIRECTION_CHANNELS, 1):
+            status = "✅" if client else "⏳"
+            lines.append(f"{i}. `{chan_id}` {status}")
+        await event.respond("\n".join(lines))
+    
+    elif subcommand == 'add' and len(parts) >= 3:
+        try:
+            chan_id = int(parts[2])
+            if chan_id in REDIRECTION_CHANNELS:
+                await event.respond(f"⚠️ Canal `{chan_id}` déjà dans la liste")
+                return
+            
+            # Vérifier que le canal existe et est accessible
+            try:
+                await client.get_entity(chan_id)
+            except Exception as e:
+                await event.respond(f"❌ Canal inaccessible: {e}\nVérifiez que le bot est membre du canal.")
+                return
+            
+            REDIRECTION_CHANNELS.append(chan_id)
+            await event.respond(f"✅ Canal `{chan_id}` ajouté!\n\n**Total:** {len(REDIRECTION_CHANNELS)} canaux")
+            logger.info(f"Admin ajoute redirection: {chan_id}")
+            
+        except ValueError:
+            await event.respond("❌ ID invalide. Format: `-1001234567890`")
+    
+    elif subcommand == 'remove' and len(parts) >= 3:
+        try:
+            chan_id = int(parts[2])
+            if chan_id in REDIRECTION_CHANNELS:
+                REDIRECTION_CHANNELS.remove(chan_id)
+                await event.respond(f"✅ Canal `{chan_id}` retiré!\n\n**Total:** {len(REDIRECTION_CHANNELS)} canaux")
+                logger.info(f"Admin retire redirection: {chan_id}")
+            else:
+                await event.respond(f"⚠️ Canal `{chan_id}` non trouvé dans la liste")
+        except ValueError:
+            await event.respond("❌ ID invalide")
+    
+    elif subcommand == 'clear':
+        count = len(REDIRECTION_CHANNELS)
+        REDIRECTION_CHANNELS.clear()
+        await event.respond(f"🗑️ {count} canaux supprimés de la liste")
+        logger.info(f"Admin clear redirections: {count} canaux")
+    
+    elif subcommand == 'test' and len(parts) >= 3:
+        try:
+            chan_id = int(parts[2])
+            test_msg = """⏳BACCARAT AI 🤖⏳ [TEST REDIRECTION]
+
+PLAYER : TEST ♠️ : TEST EN COURS...."""
+            
+            sent = await client.send_message(chan_id, test_msg)
+            await asyncio.sleep(1)
+            await client.delete_messages(chan_id, [sent.id])
+            await event.respond(f"✅ Test réussi pour `{chan_id}`")
+            
+        except Exception as e:
+            await event.respond(f"❌ Test échoué: {e}")
+    
+    else:
+        await event.respond("""📖 **COMMANDE /redirect**
+
+**Usage:**
+`/redirect` - Voir la liste
+`/redirect list` - Lister les canaux
+`/redirect add -1001234567890` - Ajouter un canal
+`/redirect remove -1001234567890` - Retirer un canal
+`/redirect clear` - Vider la liste
+`/redirect test -1001234567890` - Tester un canal
+
+**Note:** Le bot doit être admin dans les canaux de redirection.""")
+
 async def cmd_history(event):
     """Affiche l'historique des 5 derniers messages finalisés et prédictions."""
     if event.is_group or event.is_channel:
@@ -641,7 +789,6 @@ async def cmd_history(event):
         ""
     ]
     
-    # Afficher les 5 derniers messages finalisés
     recent_messages = finalized_messages_history[:5]
     
     if not recent_messages:
@@ -653,7 +800,6 @@ async def cmd_history(event):
             group = msg['first_group']
             suits = ', '.join([SUIT_DISPLAY.get(s, s) for s in msg['suits_found']]) if msg['suits_found'] else 'Aucune'
             
-            # Indicateur si ce message a servi à vérifier une prédiction
             verif_indicator = ""
             if msg['predictions_verified']:
                 verif_details = []
@@ -674,7 +820,6 @@ async def cmd_history(event):
             )
             lines.append("")
     
-    # Afficher les prédictions récentes avec leurs vérifications
     lines.append("🔮 **PRÉDICTIONS RÉCENTES**")
     lines.append("───────────────────────────────────────")
     
@@ -689,7 +834,6 @@ async def cmd_history(event):
             status = pred['status']
             pred_time = pred['predicted_at'].strftime('%H:%M:%S')
             
-            # Statut formaté
             if status == 'en_cours':
                 status_str = "⏳ En cours..."
             elif status == 'gagne_r0':
@@ -706,14 +850,12 @@ async def cmd_history(event):
             lines.append(f"🎯 **#{pred_game}** {suit} | {status_str}")
             lines.append(f"   🕐 Prédit à: {pred_time}")
             
-            # Afficher les messages de vérification
             if pred['verified_by']:
                 lines.append("   📋 Vérifié par:")
                 for v in pred['verified_by']:
                     r_text = f"R{v['rattrapage_level']}" if v['rattrapage_level'] > 0 else "Direct"
                     lines.append(f"      • Jeu #{v['game_number']} ({r_text}): `{v['first_group']}`")
             else:
-                # Montrer quels jeux doivent vérifier
                 verif_games = pred['verification_games']
                 if status == 'en_cours':
                     pending_games = [g for g in verif_games if g > current_game_number]
@@ -748,6 +890,7 @@ async def cmd_status(event):
         f"🎮 Dernier jeu: #{current_game_number}",
         f"📋 Prédictions actives: {len(pending_predictions)}",
         f"⏳ En attente finalisation: {len(waiting_finalization)}",
+        f"📡 Canaux de redirection: {len(REDIRECTION_CHANNELS)}",
         ""
     ]
     
@@ -756,8 +899,6 @@ async def cmd_status(event):
             continue
         
         tracker = cycle_trackers[suit]
-        
-        # Forcer la mise à jour au numéro actuel
         tracker.update_to_current_game(current_game_number)
         
         current = tracker.get_current_cycle_target()
@@ -770,7 +911,7 @@ async def cmd_status(event):
         if tracker.pending_prediction:
             emoji, status = "🔮", f"PRÉDICTION #{tracker.pending_prediction}"
         elif tracker.current_tour == 2:
-            emoji, status = "⚠️", f"Tour 2 critique"
+            emoji, status = "⚠️", f"Tour 2 en cours"
         elif progress > 0:
             emoji, status = "⏳", f"Tour {tracker.current_tour} en cours"
         else:
@@ -808,12 +949,16 @@ async def cmd_status(event):
             else:
                 status_str = pred['status']
             
-            lines.append(f"• #{num} {suit} ({type_str}): {status_str}")
+            redirect_count = len(pred.get('redirected_to', []))
+            redirect_info = f" [+{redirect_count}↗️]" if redirect_count > 0 else ""
+            
+            lines.append(f"• #{num} {suit} ({type_str}): {status_str}{redirect_info}")
         lines.append("")
     
     lines.extend([
         "**Légende:**",
-        "✅=Trouvé ❌=Manqué ⏳=Attente 🔮=Prédiction ⚠️=Critique"
+        "✅=Trouvé ❌=Manqué ⏳=Attente 🔮=Prédiction ⚠️=Tour2",
+        "↗️=Nombre de redirections"
     ])
     
     await event.respond("\n".join(lines))
@@ -828,14 +973,18 @@ async def cmd_help(event):
 **Système ({NUMBERS_PER_TOUR} numéros/tour, {CONSECUTIVE_FAILURES_NEEDED} tours):**
 
 • Tour 1: vérifie cycle, cycle+1, cycle+2
-• Tour 2: vérifie next_cycle, next_cycle+1, next_cycle+2
-→ Si {CONSECUTIVE_FAILURES_NEEDED} tour(s) sans trouver = PRÉDICTION
+  → Trouvé: Reset, prochain cycle = nouveau Tour 1
+  → Manqué: Passe Tour 2
+• Tour 2: vérifie cycle_suivant, +1, +2
+  → Trouvé: Reset compteur, cycle_suivant+1 = nouveau Tour 1
+  → Manqué: PRÉDICTION
 
 **Rattrapages:** ✅0️⃣ ✅1️⃣ ✅2️⃣ ❌
 
 **Commandes:**
 /status - Voir les compteurs
-/history - Voir l'historique des messages et prédictions
+/history - Voir l'historique
+/redirect - Gérer les redirections (20+ canaux)
 /set_tours [1-3] - Changer tours
 /reset - Reset manuel
 /channels - Config canaux
@@ -916,12 +1065,27 @@ async def cmd_channels(event):
     except:
         pass
     
+    redirect_status = []
+    for chan_id in REDIRECTION_CHANNELS[:5]:  # Max 5 dans l'affichage
+        try:
+            await client.get_entity(chan_id)
+            redirect_status.append(f"✅ `{chan_id}`")
+        except:
+            redirect_status.append(f"❌ `{chan_id}`")
+    
+    redirect_text = "\n".join(redirect_status) if redirect_status else "Aucun"
+    if len(REDIRECTION_CHANNELS) > 5:
+        redirect_text += f"\n... et {len(REDIRECTION_CHANNELS) - 5} autres"
+    
     msg = f"""📡 **CONFIGURATION**
 
 **Source:** `{SOURCE_CHANNEL_ID}` {src_status}
 **Prédiction:** `{PREDICTION_CHANNEL_ID}` {pred_status}
 **Admin:** `{ADMIN_ID}`
 **Port:** `{PORT}`
+
+**Redirections ({len(REDIRECTION_CHANNELS)}):**
+{redirect_text}
 
 **Cycles:** ♠️+5 ❤️+6 ♦️+6 ♣️+7
 **Paramètres:** {CONSECUTIVE_FAILURES_NEEDED} tours, {NUMBERS_PER_TOUR} num/tour"""
@@ -1014,6 +1178,7 @@ def setup_handlers():
     """Configure les handlers."""
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
+    client.add_event_handler(cmd_redirect, events.NewMessage(pattern=r'^/redirect'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
     client.add_event_handler(cmd_channels, events.NewMessage(pattern=r'^/channels$'))
