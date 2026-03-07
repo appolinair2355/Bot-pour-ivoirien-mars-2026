@@ -32,7 +32,7 @@ PORT = int(os.getenv('PORT') or '10000')
 
 # Paramètres du système de prédiction
 CONSECUTIVE_FAILURES_NEEDED = int(os.getenv('FAILURES_NEEDED', '2'))  # 2 tours avant prédiction
-NUMBERS_PER_TOUR = 3  # 3 numéros vérifiés par tour  ← MANQUAIT CETTE LIGNE !
+NUMBERS_PER_TOUR = 3  # 3 numéros vérifiés par tour (mode standard)
 
 # Cycles des couleurs
 SUIT_CYCLES = {
