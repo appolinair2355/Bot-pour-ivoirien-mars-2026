@@ -49,7 +49,11 @@ client = None
 suit_block_until: Dict[str, datetime] = {}
 waiting_finalization: Dict[int, dict] = {}
 
-# NOUVEAU : Historiques pour la commande /history
+# Variables pour le mode hyper serré (modifiables à chaud)
+hyper_serré_active = False
+hyper_serré_h = 5
+
+# Historiques pour la commande /history
 finalized_messages_history: List[Dict] = []
 MAX_HISTORY_SIZE = 50
 prediction_history: List[Dict] = []
@@ -121,23 +125,24 @@ class SuitCycleTracker:
     
     def get_numbers_to_check_this_tour(self) -> List[int]:
         """
-        Retourne les 3 numéros à vérifier pour le tour actuel.
-        Tour 1: cycle actuel, cycle+1, cycle+2
-        Tour 2: cycle suivant, cycle_suivant+1, cycle_suivant+2
+        Retourne les numéros à vérifier pour le tour actuel.
+        Mode standard: 3 numéros consécutifs depuis le cycle actuel
+        Mode hyper serré: h numéros consécutifs depuis le cycle actuel
         """
-        if self.current_tour == 1:
-            # Tour 1: base sur le cycle actuel
-            current_cycle = self.get_current_cycle_target()
-            if current_cycle is None:
-                return []
-            return [current_cycle, current_cycle + 1, current_cycle + 2]
-        else:
-            # Tour 2: base sur le cycle suivant
-            next_idx = self.last_cycle_index + 1
-            if next_idx < len(self.cycle_numbers):
-                next_cycle = self.cycle_numbers[next_idx]
-                return [next_cycle, next_cycle + 1, next_cycle + 2]
+        global hyper_serré_active, hyper_serré_h
+        
+        current_cycle = self.get_current_cycle_target()
+        if current_cycle is None:
             return []
+        
+        # Déterminer combien de numéros vérifier
+        if hyper_serré_active:
+            count = hyper_serré_h  # Mode hyper serré: h numéros
+        else:
+            count = NUMBERS_PER_TOUR  # Mode standard: 3 numéros
+        
+        # Retourner les numéros consécutifs depuis le cycle actuel
+        return [current_cycle + i for i in range(count)]
     
     def is_number_in_current_tour(self, game_number: int) -> bool:
         """Vérifie si le numéro fait partie du tour actuel."""
@@ -150,6 +155,8 @@ class SuitCycleTracker:
         Traite la vérification d'un numéro.
         Retourne le numéro de prédiction si une prédiction doit être créée.
         """
+        global hyper_serré_active, hyper_serré_h
+        
         # Mettre à jour le cycle en fonction du jeu actuel
         self.update_to_current_game(game_number)
         
@@ -165,30 +172,45 @@ class SuitCycleTracker:
         self.verification_history[game_number] = suit_found
         
         if suit_found:
-            logger.info(f"✅ {self.suit} trouvé au jeu #{game_number} (Tour {self.current_tour}) - RESET")
+            logger.info(f"✅ {self.suit} trouvé au jeu #{game_number} - RESET")
             self.reset()
             return None
         
         # Pas trouvé
         tour_misses = len(self.tour_checked_numbers)
-        logger.info(f"❌ {self.suit} manqué au jeu #{game_number} (Tour {self.current_tour}, {tour_misses}/{NUMBERS_PER_TOUR})")
         
-        # Tour terminé (3 numéros vérifiés)
-        if tour_misses >= NUMBERS_PER_TOUR:
+        # Déterminer le nombre nécessaire pour prédiction
+        if hyper_serré_active:
+            needed = hyper_serré_h
+        else:
+            needed = NUMBERS_PER_TOUR
+            
+        logger.info(f"❌ {self.suit} manqué au jeu #{game_number} ({tour_misses}/{needed})")
+        
+        # Tour terminé (tous les numéros vérifiés sans succès)
+        if tour_misses >= needed:
             # Incrémenter le compteur de manques (tours complétés sans trouver)
             self.miss_counter += 1
-            logger.info(f"📊 {self.suit} Tour {self.current_tour} terminé - Manques: {self.miss_counter}/{CONSECUTIVE_FAILURES_NEEDED}")
+            logger.info(f"📊 {self.suit} Tour terminé - Manques: {self.miss_counter}/{CONSECUTIVE_FAILURES_NEEDED}")
             
             # VÉRIFICATION: Assez de manques pour prédire ?
             if self.miss_counter >= CONSECUTIVE_FAILURES_NEEDED:
-                # PRÉDICTION: jouer au cycle après le dernier vérifié
-                # Si Tour 1 échoué → prédire cycle+1 (prochain cycle)
-                # Si Tour 1+2 échoués → prédire cycle d'après le tour 2
-                pred_idx = self.last_cycle_index + self.miss_counter
-                if pred_idx < len(self.cycle_numbers):
-                    pred_num = self.cycle_numbers[pred_idx]
+                current_cycle = self.get_current_cycle_target()
+                if current_cycle is not None:
+                    
+                    # CHOIX DU MODE DE PRÉDICTION
+                    if hyper_serré_active:
+                        # MODE HYPER SERRÉ: cycle + h + 1
+                        pred_num = current_cycle + hyper_serré_h + 1
+                        mode_str = f"h+1 ({hyper_serré_h}+1)"
+                    else:
+                        # MODE STANDARD: cycle + intervalle - 1
+                        interval = SUIT_CYCLES[self.suit]['interval']
+                        pred_num = current_cycle + interval - 1
+                        mode_str = f"intervalle-1 ({interval}-1)"
+                    
                     self.pending_prediction = pred_num
-                    logger.info(f"🔮 {self.suit} PRÉDICTION pour #{pred_num} (après {self.miss_counter} tour(s) échoué(s))")
+                    logger.info(f"🔮 {self.suit} PRÉDICTION pour #{pred_num} (cycle #{current_cycle} + {mode_str})")
                     self.reset_after_prediction()
                     return pred_num
             
@@ -196,9 +218,10 @@ class SuitCycleTracker:
             if self.current_tour < CONSECUTIVE_FAILURES_NEEDED:
                 self.current_tour += 1
                 self.tour_checked_numbers.clear()
-                # Avancer l'index pour le prochain tour (Tour 2 utilise le cycle suivant)
+                # Avancer l'index pour le prochain tour (utilise le cycle suivant)
                 self.last_cycle_index += 1
-                logger.info(f"🔄 {self.suit} passe au Tour {self.current_tour} (cycle suivant)")
+                next_cycle = self.get_current_cycle_target()
+                logger.info(f"🔄 {self.suit} passe au Tour {self.current_tour} (cycle #{next_cycle})")
             else:
                 # On a fait tous les tours nécessaires mais pas de prédition ?
                 logger.warning(f"⚠️ {self.suit} tous tours terminés mais pas de prédiction")
@@ -627,6 +650,102 @@ async def perform_full_reset(reason: str):
 # COMMANDES ADMIN
 # ============================================================================
 
+async def cmd_h(event):
+    """Commande hyper serré - définit le nombre h de numéros à vérifier."""
+    global hyper_serré_active, hyper_serré_h
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    try:
+        # Format: /h 5 ou /h off ou /h on
+        parts = event.message.message.split()
+        
+        if len(parts) == 1:
+            # Juste /h - afficher le statut
+            mode_str = "✅ ACTIF" if hyper_serré_active else "❌ INACTIF"
+            await event.respond(
+                f"📊 **MODE HYPER SERRÉ**\n\n"
+                f"Statut: {mode_str}\n"
+                f"h = {hyper_serré_h} numéros à vérifier\n\n"
+                f"Usage:\n"
+                f"`/h [nombre]` - Activer avec h numéros (3-10)\n"
+                f"`/h off` - Désactiver (retour mode standard)\n"
+                f"`/h on` - Réactiver avec la dernière valeur"
+            )
+            return
+        
+        arg = parts[1].lower()
+        
+        if arg == 'off':
+            hyper_serré_active = False
+            # Reset tous les trackers
+            for tracker in cycle_trackers.values():
+                tracker.reset()
+            await event.respond(
+                f"❌ **Mode hyper serré DÉSACTIVÉ**\n\n"
+                f"Retour au mode standard:\n"
+                f"• Vérifie {NUMBERS_PER_TOUR} numéros\n"
+                f"• Prédit cycle + intervalle - 1\n\n"
+                f"Compteurs reset."
+            )
+            logger.info(f"Admin désactive mode hyper serré")
+            return
+        
+        if arg == 'on':
+            hyper_serré_active = True
+            for tracker in cycle_trackers.values():
+                tracker.reset()
+            await event.respond(
+                f"✅ **Mode hyper serré ACTIVÉ**\n\n"
+                f"h = {hyper_serré_h} numéros à vérifier\n"
+                f"Prédiction = cycle + h + 1\n\n"
+                f"Compteurs reset."
+            )
+            logger.info(f"Admin active mode hyper serré (h={hyper_serré_h})")
+            return
+        
+        # Sinon c'est un nombre
+        try:
+            h_val = int(arg)
+            if not 3 <= h_val <= 15:
+                await event.respond("❌ h doit être entre 3 et 15")
+                return
+            
+            old_h = hyper_serré_h
+            hyper_serré_h = h_val
+            hyper_serré_active = True
+            
+            # Reset tous les trackers
+            for tracker in cycle_trackers.values():
+                tracker.reset()
+            
+            # Exemple selon le mode
+            example_cycle = 1020
+            example_pred = example_cycle + h_val + 1
+            
+            await event.respond(
+                f"✅ **Mode hyper serré configuré**\n\n"
+                f"h: {old_h} → **{hyper_serré_h}**\n"
+                f"Statut: ✅ ACTIF\n\n"
+                f"📋 **Fonctionnement:**\n"
+                f"• Vérification sur {h_val} numéros consécutifs\n"
+                f"• Si tous échouent → prédiction = cycle + h + 1\n"
+                f"• Exemple: cycle {example_cycle} échoue sur {example_cycle}-{example_cycle+h_val-1}\n"
+                f"  → Prédiction: **{example_pred}**\n\n"
+                f"Compteurs reset pour nouvelle analyse."
+            )
+            logger.info(f"Admin set h={h_val} (hyper serré)")
+            
+        except ValueError:
+            await event.respond("❌ Usage: `/h [3-15]`, `/h on` ou `/h off`")
+            
+    except Exception as e:
+        await event.respond(f"❌ Erreur: {e}")
+
 async def cmd_history(event):
     """Affiche l'historique des 5 derniers messages finalisés et prédictions."""
     if event.is_group or event.is_channel:
@@ -736,14 +855,25 @@ async def cmd_history(event):
 
 async def cmd_status(event):
     """Affiche les compteurs détaillés."""
+    global hyper_serré_active, hyper_serré_h
+    
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
     
+    # Déterminer le mode et les paramètres à afficher
+    if hyper_serré_active:
+        mode_str = f"🔥 HYPER SERRÉ (h={hyper_serré_h})"
+        count_needed = hyper_serré_h
+    else:
+        mode_str = f"📊 STANDARD ({NUMBERS_PER_TOUR} num/tour)"
+        count_needed = NUMBERS_PER_TOUR
+    
     lines = [
         "📈 **COUNTERS DE MANQUES DES CYCLES**",
+        f"Mode: {mode_str}",
         "",
         f"🎮 Dernier jeu: #{current_game_number}",
         f"📋 Prédictions actives: {len(pending_predictions)}",
@@ -765,7 +895,11 @@ async def cmd_status(event):
         checked = tracker.tour_checked_numbers
         
         progress = len(checked)
-        bar = f"[{'█' * progress}{'░' * (NUMBERS_PER_TOUR - progress)}]"
+        
+        # Barre de progression adaptée
+        bar_filled = '█' * progress
+        bar_empty = '░' * (count_needed - progress)
+        bar = f"[{bar_filled}{bar_empty}]"
         
         if tracker.pending_prediction:
             emoji, status = "🔮", f"PRÉDICTION #{tracker.pending_prediction}"
@@ -776,21 +910,38 @@ async def cmd_status(event):
         else:
             emoji, status = "✅", "En attente"
         
+        # Afficher les numéros avec indicateurs
         nums = []
-        for n in to_check:
+        for i, n in enumerate(to_check):
             if n in checked:
                 found = tracker.verification_history.get(n, False)
                 nums.append(f"{'✅' if found else '❌'}{n}")
             else:
                 nums.append(f"⏳{n}")
         
+        # Info de prédiction selon le mode
+        if hyper_serré_active:
+            if current:
+                pred_num = current + hyper_serré_h + 1
+                pred_info = f"Si échec → prédit #{pred_num} (cycle+{hyper_serré_h}+1)"
+            else:
+                pred_info = "N/A"
+        else:
+            if current:
+                interval = SUIT_CYCLES[suit]['interval']
+                pred_num = current + interval - 1
+                pred_info = f"Si échec → prédit #{pred_num} (cycle+{interval}-1)"
+            else:
+                pred_info = "N/A"
+        
         lines.extend([
             f"📊 {tracker.get_display_name()} {emoji}",
             f"   ├─ 🎯 Cycle: #{current if current else 'N/A'}",
             f"   ├─ 🔄 Tour: {tracker.current_tour}/{CONSECUTIVE_FAILURES_NEEDED}",
             f"   ├─ 📉 Manques: {tracker.miss_counter}/{CONSECUTIVE_FAILURES_NEEDED}",
-            f"   ├─ 🔍 {bar} ({progress}/{NUMBERS_PER_TOUR})",
+            f"   ├─ 🔍 {bar} ({progress}/{count_needed})",
             f"   ├─ 🎲 {' → '.join(nums) if nums else 'N/A'}",
+            f"   ├─ 📝 {pred_info}",
             f"   └─ 📌 {status}",
             ""
         ])
@@ -825,18 +976,23 @@ async def cmd_help(event):
     
     help_text = f"""📖 **BACCARAT AI - AIDE**
 
-**Système ({NUMBERS_PER_TOUR} numéros/tour, {CONSECUTIVE_FAILURES_NEEDED} tours):**
+**Système de prédiction:**
 
-• Tour 1: vérifie cycle, cycle+1, cycle+2
-• Tour 2: vérifie next_cycle, next_cycle+1, next_cycle+2
-→ Si {CONSECUTIVE_FAILURES_NEEDED} tour(s) sans trouver = PRÉDICTION
+• Analyse les cycles de chaque couleur
+• Mode standard: vérifie 3 numéros, prédit cycle+intervalle-1
+• Mode hyper serré (/h): vérifie h numéros, prédit cycle+h+1
+
+**Exemples:**
+• Standard ♥ (intervalle 6): échec 1020-1022 → prédit 1025
+• Hyper serré h=5: échec 596-600 → prédit 602
 
 **Rattrapages:** ✅0️⃣ ✅1️⃣ ✅2️⃣ ❌
 
 **Commandes:**
 /status - Voir les compteurs
-/history - Voir l'historique des messages et prédictions
-/set_tours [1-3] - Changer tours
+/h [n/on/off] - Mode hyper serré
+/history - Historique messages/prédictions
+/set_tours [1-3] - Changer tours avant prédiction
 /reset - Reset manuel
 /channels - Config canaux
 /test - Test envoi
@@ -916,6 +1072,12 @@ async def cmd_channels(event):
     except:
         pass
     
+    # Info mode hyper serré
+    if hyper_serré_active:
+        mode_info = f"🔥 Hyper serré ON (h={hyper_serré_h})"
+    else:
+        mode_info = f"📊 Standard (prédit cycle+intervalle-1)"
+    
     msg = f"""📡 **CONFIGURATION**
 
 **Source:** `{SOURCE_CHANNEL_ID}` {src_status}
@@ -923,8 +1085,10 @@ async def cmd_channels(event):
 **Admin:** `{ADMIN_ID}`
 **Port:** `{PORT}`
 
-**Cycles:** ♠️+5 ❤️+6 ♦️+6 ♣️+7
-**Paramètres:** {CONSECUTIVE_FAILURES_NEEDED} tours, {NUMBERS_PER_TOUR} num/tour"""
+**Mode:** {mode_info}
+**Tours:** {CONSECUTIVE_FAILURES_NEEDED} avant prédiction
+
+**Cycles:** ♠️+5 ❤️+6 ♦️+6 ♣️+7"""
     
     await event.respond(msg)
 
@@ -1012,6 +1176,9 @@ async def cmd_announce(event):
 
 def setup_handlers():
     """Configure les handlers."""
+    # Nouvelle commande /h pour hyper serré
+    client.add_event_handler(cmd_h, events.NewMessage(pattern=r'^/h'))
+    
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
@@ -1072,7 +1239,7 @@ async def main():
         await site.start()
         
         logger.info(f"🌐 Web server port {PORT}")
-        logger.info(f"📊 {NUMBERS_PER_TOUR} num/tour, {CONSECUTIVE_FAILURES_NEEDED} tours")
+        logger.info(f"📊 Mode standard: cycle+intervalle-1 | Hyper serré: cycle+h+1")
         
         await client.run_until_disconnected()
         
